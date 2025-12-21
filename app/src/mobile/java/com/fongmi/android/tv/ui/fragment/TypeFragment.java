@@ -14,6 +14,7 @@ import androidx.viewbinding.ViewBinding;
 
 import com.fongmi.android.tv.Product;
 import com.fongmi.android.tv.api.config.VodConfig;
+import com.fongmi.android.tv.bean.Filter;
 import com.fongmi.android.tv.bean.Result;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.bean.Style;
@@ -38,6 +39,7 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     private CustomScroller mScroller;
     private SiteViewModel mViewModel;
     private VodAdapter mAdapter;
+    private java.util.List<Filter> mCategoryFilters;
 
     public static TypeFragment newInstance(String key, String typeId, Style style, HashMap<String, String> extend, boolean folder, int y) {
         Bundle args = new Bundle();
@@ -155,6 +157,47 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         if (size > 0) addVideo(result);
         mScroller.endLoading(result);
         checkMore(size);
+        // For non-home categories: cache and apply filters if categoryContent returns them
+        if (!isHome() && result.getFilters() != null && !result.getFilters().isEmpty()) {
+            // 检查是否包含当前typeId的filters（正常情况）
+            if (result.getFilters().containsKey(getTypeId())) {
+                mCategoryFilters = result.getFilters().get(getTypeId());
+            } else {
+                // jar主动推送filters的情况：filters的key不是当前typeId，取第一个值
+                mCategoryFilters = result.getFilters().values().iterator().next();
+            }
+            
+            for (Filter filter : mCategoryFilters) {
+                // Preserve user's selection from mExtends, fallback to init if not selected
+                String currentValue = mExtends.get(filter.getKey());
+                if (currentValue != null) {
+                    filter.setActivated(currentValue);
+                } else if (filter.getInit() != null) {
+                    filter.setActivated(filter.getInit());
+                }
+            }
+            
+            // Notify parent VodFragment to update Class filters for this type
+            try {
+                androidx.fragment.app.Fragment parent = getParentFragment();
+                if (parent instanceof com.fongmi.android.tv.ui.fragment.VodFragment) {
+                    ((com.fongmi.android.tv.ui.fragment.VodFragment) parent).updateCategoryFilters(getTypeId(), mCategoryFilters);
+                } else if (parent instanceof com.fongmi.android.tv.ui.fragment.FolderFragment) {
+                    androidx.fragment.app.Fragment vod = parent.getParentFragment();
+                    if (vod instanceof com.fongmi.android.tv.ui.fragment.VodFragment) {
+                        ((com.fongmi.android.tv.ui.fragment.VodFragment) vod).updateCategoryFilters(getTypeId(), mCategoryFilters);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            
+            // If FilterDialog is open, update it
+            for (androidx.fragment.app.Fragment f : getChildFragmentManager().getFragments()) {
+                if (f instanceof com.fongmi.android.tv.ui.dialog.FilterDialog) {
+                    ((com.fongmi.android.tv.ui.dialog.FilterDialog) f).updateFilters(mCategoryFilters);
+                }
+            }
+        }
     }
 
     private void addVideo(Result result) {
@@ -208,5 +251,42 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         if (item.isAction() || item.isFolder()) return false;
         SearchActivity.start(requireActivity(), item.getVodName());
         return true;
+    }
+
+    public java.util.List<Filter> getCategoryFilters() {
+        return mCategoryFilters;
+    }
+
+    // Backward-compatible initializer for category filters. Some callers may invoke
+    // initCategoryFilters(filters) directly; provide it to avoid compile errors and
+    // to apply the same preservation logic as setAdapter when filters are provided.
+    public void initCategoryFilters(java.util.List<Filter> filters) {
+        if (filters == null) return;
+        mCategoryFilters = filters;
+        for (Filter filter : mCategoryFilters) {
+            String currentValue = mExtends.get(filter.getKey());
+            if (currentValue != null) {
+                filter.setActivated(currentValue);
+            } else if (filter.getInit() != null) {
+                filter.setActivated(filter.getInit());
+            }
+        }
+        try {
+            androidx.fragment.app.Fragment parent = getParentFragment();
+            if (parent instanceof com.fongmi.android.tv.ui.fragment.VodFragment) {
+                ((com.fongmi.android.tv.ui.fragment.VodFragment) parent).updateCategoryFilters(getTypeId(), mCategoryFilters);
+            } else if (parent instanceof com.fongmi.android.tv.ui.fragment.FolderFragment) {
+                androidx.fragment.app.Fragment vod = parent.getParentFragment();
+                if (vod instanceof com.fongmi.android.tv.ui.fragment.VodFragment) {
+                    ((com.fongmi.android.tv.ui.fragment.VodFragment) vod).updateCategoryFilters(getTypeId(), mCategoryFilters);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        for (androidx.fragment.app.Fragment f : getChildFragmentManager().getFragments()) {
+            if (f instanceof com.fongmi.android.tv.ui.dialog.FilterDialog) {
+                ((com.fongmi.android.tv.ui.dialog.FilterDialog) f).updateFilters(mCategoryFilters);
+            }
+        }
     }
 }

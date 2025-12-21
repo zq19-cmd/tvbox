@@ -21,6 +21,7 @@ public class FilterDialog extends BaseDialog {
     private DialogFilterBinding binding;
     private FilterCallback callback;
     private List<Filter> filter;
+    private com.fongmi.android.tv.ui.adapter.FilterAdapter mAdapter;
 
     public static FilterDialog create() {
         return new FilterDialog();
@@ -44,7 +45,15 @@ public class FilterDialog extends BaseDialog {
 
     @Override
     protected void initView() {
-        binding.recycler.setAdapter(new FilterAdapter(callback, filter));
+        mAdapter = new FilterAdapter(callback, filter);
+        binding.recycler.setAdapter(mAdapter);
         binding.recycler.setHasFixedSize(true);
+    }
+
+    public void updateFilters(List<Filter> filters) {
+        this.filter = filters;
+        if (mAdapter == null) return;
+        // replace adapter data by creating a new adapter instance to keep it simple
+        binding.recycler.post(() -> binding.recycler.setAdapter(new com.fongmi.android.tv.ui.adapter.FilterAdapter(callback, filter)));
     }
 }

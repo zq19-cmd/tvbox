@@ -1,0 +1,28 @@
+# 二进制文件
+ws-proxy-server
+ws-proxy-server.exe
+ws-proxy-*
+build/
+
+# 日志文件
+*.log
+nohup.out
+
+# Go 相关
+go.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 证书文件
+*.pem
+*.key
+*.crt
+
+# 临时文件
+*.tmp
+*.bak

@@ -99,4 +99,42 @@ public class BaseLoader {
     public JSONObject jsonExtMix(String flag, String key, String name, LinkedHashMap<String, HashMap<String, String>> jxs, String url) throws Throwable {
         return jarLoader.jsonExtMix(flag, key, name, jxs, url);
     }
+
+    // ========== jar 反射调用接口 ==========
+    
+    /**
+     * 供 jar 通过反射调用 PyLoader.getSpider()
+     */
+    public static Spider jarCallPyLoader(String key, String api, String ext) {
+        try {
+            return BaseLoader.get().pyLoader.getSpider(key, api, ext);
+        } catch (Throwable e) {
+            e.printStackTrace();
+            return new SpiderNull();
+        }
+    }
+
+    /**
+     * 供 jar 通过反射调用 JsLoader.getSpider()
+     */
+    public static Spider jarCallJsLoader(String key, String api, String ext, String jar) {
+        try {
+            return BaseLoader.get().jsLoader.getSpider(key, api, ext, jar);
+        } catch (Throwable e) {
+            e.printStackTrace();
+            return new SpiderNull();
+        }
+    }
+
+    /**
+     * 供 jar 通过反射调用 JarLoader.getSpider()
+     */
+    public static Spider jarCallJarLoader(String key, String api, String ext, String jar) {
+        try {
+            return BaseLoader.get().jarLoader.getSpider(key, api, ext, jar);
+        } catch (Throwable e) {
+            e.printStackTrace();
+            return new SpiderNull();
+        }
+    }
 }

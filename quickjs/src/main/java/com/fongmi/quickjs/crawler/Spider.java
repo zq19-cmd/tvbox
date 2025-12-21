@@ -43,11 +43,14 @@ public class Spider extends com.github.catvod.crawler.Spider {
     private boolean cat;
 
     public Spider(String key, String api, DexClassLoader dex) throws Exception {
+        System.out.println("QuickJS Spider 构造函数: key=" + key + ", api_length=" + (api == null ? 0 : api.length()) + ", dex=" + (dex == null ? "null" : dex.getClass().getName()));
         this.executor = Executors.newSingleThreadExecutor();
         this.key = key;
         this.api = api;
         this.dex = dex;
+        System.out.println("QuickJS Spider 构造函数: 调用 initializeJS");
         initializeJS();
+        System.out.println("QuickJS Spider 构造函数: initializeJS 完成");
     }
 
     private void submit(Runnable runnable) {
@@ -146,50 +149,88 @@ public class Spider extends com.github.catvod.crawler.Spider {
     }
 
     private void initializeJS() throws Exception {
+        System.out.println("QuickJS initializeJS: 开始");
         submit(() -> {
+            System.out.println("QuickJS initializeJS: 线程池任务开始");
             createCtx();
+            System.out.println("QuickJS initializeJS: createCtx 完成");
             createFun();
+            System.out.println("QuickJS initializeJS: createFun 完成");
             createObj();
+            System.out.println("QuickJS initializeJS: createObj 完成");
             return null;
         }).get();
+        System.out.println("QuickJS initializeJS: 完成");
     }
 
     private void createCtx() {
+        System.out.println("QuickJS createCtx: 开始");
         ctx = QuickJSContext.create();
+        System.out.println("QuickJS createCtx: QuickJSContext 创建成功");
         ctx.setConsole(new Console());
         ctx.evaluate(Asset.read("js/lib/http.js"));
+        System.out.println("QuickJS createCtx: http.js 加载成功");
         ctx.getGlobalObject().setProperty("local", Local.class);
         ctx.setModuleLoader(new QuickJSContext.BytecodeModuleLoader() {
             @Override
             public String moduleNormalizeName(String baseModuleName, String moduleName) {
+                System.out.println("QuickJS moduleNormalizeName: baseModuleName=" + baseModuleName + ", moduleName=" + moduleName);
                 return UriUtil.resolve(baseModuleName, moduleName);
             }
 
             @Override
             public byte[] getModuleBytecode(String moduleName) {
-                return ctx.compileModule(Module.get().fetch(moduleName), moduleName);
+                System.out.println("QuickJS getModuleBytecode: moduleName=" + moduleName);
+                String moduleContent = Module.get().fetch(moduleName);
+                if (moduleContent == null || moduleContent.isEmpty()) {
+                    System.out.println("QuickJS getModuleBytecode: Module.get().fetch 返回空值！");
+                    return new byte[0];
+                }
+                System.out.println("QuickJS getModuleBytecode: 成功获取模块内容，长度=" + moduleContent.length());
+                return ctx.compileModule(moduleContent, moduleName);
             }
         });
+        System.out.println("QuickJS createCtx: 完成");
     }
 
     private void createFun() {
+        System.out.println("QuickJS createFun: 开始");
         try {
             Global.create(ctx, executor);
+            System.out.println("QuickJS createFun: Global.create 完成");
             Class<?> clz = dex.loadClass("com.github.catvod.js.Function");
+            System.out.println("QuickJS createFun: 加载 Function 类成功");
             clz.getDeclaredConstructor(QuickJSContext.class).newInstance(ctx);
+            System.out.println("QuickJS createFun: Function 实例创建成功");
         } catch (Throwable e) {
+            System.out.println("QuickJS createFun: 异常 -> " + e.getMessage());
             e.printStackTrace();
         }
+        System.out.println("QuickJS createFun: 完成");
     }
 
     private void createObj() {
+        System.out.println("QuickJS createObj: 开始");
         String spider = "__JS_SPIDER__";
         String global = "globalThis." + spider;
+        System.out.println("QuickJS createObj: 调用 Module.get().fetch(api), api_length=" + (api == null ? 0 : api.length()));
         String content = Module.get().fetch(api);
+        System.out.println("QuickJS createObj: 获取内容完成, 返回值=" + (content == null ? "null" : "长度=" + content.length()));
+        
+        if (content == null || content.isEmpty()) {
+            System.out.println("QuickJS createObj: 错误！内容为空，无法继续");
+            throw new RuntimeException("Module.get().fetch(api) 返回空值");
+        }
+        
         cat = content.contains("__jsEvalReturn");
+        System.out.println("QuickJS createObj: cat=" + cat);
         ctx.evaluateModule(content.replace(spider, global), api);
+        System.out.println("QuickJS createObj: evaluateModule (1) 完成");
         ctx.evaluateModule(String.format(Asset.read("js/lib/spider.js"), api));
+        System.out.println("QuickJS createObj: evaluateModule (2) 完成");
         jsObject = (JSObject) ctx.getProperty(ctx.getGlobalObject(), spider);
+        System.out.println("QuickJS createObj: jsObject 获取完成, " + (jsObject == null ? "null" : "已获取"));
+        System.out.println("QuickJS createObj: 完成");
     }
 
     private JSObject cfg(String ext) {

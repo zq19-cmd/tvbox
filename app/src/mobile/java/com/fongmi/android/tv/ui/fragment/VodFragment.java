@@ -161,6 +161,17 @@ public class VodFragment extends BaseFragment implements ConfigCallback, SiteCal
         }
     }
 
+    public void updateCategoryFilters(String typeId, java.util.List<com.fongmi.android.tv.bean.Filter> filters) {
+        for (int i = 0; i < mAdapter.getItemCount(); i++) {
+            com.fongmi.android.tv.bean.Class item = mAdapter.get(i);
+            if (item.getTypeId().equals(typeId)) {
+                item.setFilters(filters);
+                mAdapter.notifyItemChanged(i);
+                break;
+            }
+        }
+    }
+
     private void onTop(View view) {
         getFragment().scrollToTop();
         mBinding.top.setVisibility(View.INVISIBLE);
@@ -182,7 +193,21 @@ public class VodFragment extends BaseFragment implements ConfigCallback, SiteCal
     }
 
     private void onFilter(View view) {
-        if (mAdapter.getItemCount() > 0) FilterDialog.create().filter(mAdapter.get(mBinding.pager.getCurrentItem()).getFilters()).show(this);
+        if (mAdapter.getItemCount() > 0) {
+            java.util.List<com.fongmi.android.tv.bean.Filter> filters = null;
+            // Try to get category-specific filters from the current TypeFragment
+            try {
+                com.fongmi.android.tv.ui.fragment.FolderFragment folder = getFragment();
+                if (folder != null) {
+                    com.fongmi.android.tv.ui.fragment.TypeFragment child = folder.getChild();
+                    if (child != null) filters = child.getCategoryFilters();
+                }
+            } catch (Exception ignored) {
+            }
+            // Fallback to Class filters if category filters not available
+            if (filters == null) filters = mAdapter.get(mBinding.pager.getCurrentItem()).getFilters();
+            FilterDialog.create().filter(filters).show(this);
+        }
     }
 
     private boolean onMenuItemClick(MenuItem item) {
@@ -246,6 +271,25 @@ public class VodFragment extends BaseFragment implements ConfigCallback, SiteCal
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onCastEvent(CastEvent event) {
         ReceiveDialog.create().event(event).show(this);
+    }
+
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onFiltersUpdateEvent(com.fongmi.android.tv.event.FiltersUpdateEvent event) {
+        // jar爬虫主动推送的筛选项更新
+        if (event == null || event.getTypeId() == null || event.getFilters() == null) return;
+        
+        // 更新适配器中的筛选项
+        updateCategoryFilters(event.getTypeId(), event.getFilters());
+        
+        // 如果当前正在显示该分类，同时更新TypeFragment
+        try {
+            com.fongmi.android.tv.ui.fragment.FolderFragment folder = getFragment();
+            if (folder != null) {
+                com.fongmi.android.tv.ui.fragment.TypeFragment child = folder.getChild();
+                if (child != null) child.initCategoryFilters(event.getFilters());
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @Override

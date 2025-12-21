@@ -1,0 +1,19 @@
+安装 Go 语言: https://golang.org/dl/
+
+cd tools/ws-proxy-server
+go mod tidy
+
+Windows直接cmd里执行：.\build.bat
+
+Linux/macOS/Termux执行：
+chmod +x build.sh
+./build.sh
+
+
+
+编译完成后文件输出到 build/ 目录！
+
+如果要让文件更小，可以安装upx（termux：pkg install upx）。
+如果编译提示gorilla/websocket: no such package，需要运行 go mod tidy 下载依赖
+第一次编译会下载依赖，比较慢，之后会快很多
+如果编译失败，检查一下 Go 版本 >= 1.16，运行 go mod tidy 重新下载依赖

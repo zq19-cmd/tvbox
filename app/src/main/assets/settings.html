@@ -1,0 +1,268 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>API Settings</title>
+  <link rel="stylesheet" href="/assets/css/ui.css">
+  <link rel="stylesheet" href="/assets/css/style.css">
+  <style>
+    :root{--card-bg:#ffffff;--muted:#666}
+    body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;padding:18px;background:var(--weui-BG-0)}
+    .container{max-width:900px;margin:0 auto}
+    .card{background:var(--card-bg);border-radius:8px;padding:16px;box-shadow:0 6px 18px rgba(0,0,0,0.06);margin-bottom:14px}
+    h2{margin:0 0 10px 0;font-size:20px}
+    .field{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #eee}
+    .field:last-child{border-bottom:none}
+    .field label{flex:1;font-size:14px;color:var(--muted)}
+    .field .control{flex:1;text-align:right}
+    input[type=text]{width:100%;padding:8px;border:1px solid #ddd;border-radius:6px}
+    .group-title{font-weight:600;margin-top:6px;margin-bottom:8px}
+    .controls{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+    .btn{background:#2d8cf0;color:#fff;padding:8px 14px;border-radius:6px;border:none;cursor:pointer}
+    .btn.secondary{background:#f5f7fa;color:#333}
+    .hint{font-size:12px;color:#999;margin-top:6px}
+    .toggle{width:44px;height:24px;border-radius:12px;display:inline-block;position:relative;background:#e6e6e6;vertical-align:middle}
+    .toggle input{display:none}
+    .toggle .knob{position:absolute;left:3px;top:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:left .18s}
+    .toggle.on{background:#2d8cf0}
+    .toggle.on .knob{left:23px}
+    @media (max-width:600px){.field{flex-direction:column;align-items:flex-start}.field .control{text-align:left;margin-top:8px}}
+  </style>
+</head>
+<body>
+  <h2>API 设置</h2>
+  <div class="container">
+    <div class="card">
+      <h2>API 设置</h2>
+      <div class="field">
+        <label>当前站源</label>
+        <div class="control"><input type="text" id="siteKey" placeholder="留空恢复默认"></div>
+      </div>
+
+      <div class="group-title">输出控制</div>
+      <div class="field">
+        <label>Raw 输出</label>
+        <div class="control"><span id="rawWrap"><label class="toggle"><input type="checkbox" id="raw"><span class="knob"></span></label></span></div>
+      </div>
+      <div class="field">
+        <label>Style 输出</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="style"><span class="knob"></span></label></div>
+      </div>
+      <div class="field">
+        <label>Filters 输出</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="filters"><span class="knob"></span></label></div>
+      </div>
+
+      <div class="group-title">播放与筛选</div>
+      <div class="field">
+        <label>播放代理</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="playProxy"><span class="knob"></span></label></div>
+      </div>
+      <div class="field">
+        <label>重写播放地址</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="rewritePlayUrl"><span class="knob"></span></label></div>
+      </div>
+      <div class="field">
+        <label>显示站点菜单</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="siteMenu"><span class="knob"></span></label></div>
+      </div>
+
+      <div class="group-title">嗅探设置</div>
+      <div class="field">
+        <label>嗅探关键字</label>
+        <div class="control"><input type="text" id="sniffKeywords" placeholder="关键字，用 | 分隔，留空使用壳子默认"></div>
+      </div>
+      <div class="field">
+        <label>嗅探请求头</label>
+        <div class="control"><input type="text" id="sniffHeaders" placeholder="自定义请求头，例如: Referer:http://...;UA:..."></div>
+      </div>
+      <div class="field">
+        <label>嗅探 JS</label>
+        <div class="control"><input type="text" id="sniffJs" placeholder="可执行的 JS 脚本（谨慎）"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>WebSocket 设置</h2>
+      <div class="field">
+        <label>WS URL</label>
+        <div class="control" style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="wsUrl" placeholder="wss://example.com/ws" style="flex:1">
+          <button id="wsCheckBtn" class="btn secondary" type="button">测试连接</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>自动连接 WS</label>
+        <div class="control"><label class="toggle"><input type="checkbox" id="wsAuto"><span class="knob"></span></label></div>
+      </div>
+      <div class="hint">提示：启用自动连接后，应用壳子时会尝试连接该 WS。</div>
+      <div class="field">
+        <label>WS 状态</label>
+        <div class="control"><span id="wsStatus" class="hint">未检测</span> <button id="wsStatusBtn" class="btn secondary" type="button">刷新状态</button></div>
+      </div>
+      <div class="field">
+        <label>透传地址</label>
+        <div class="control">
+          <span id="proxyUrl" class="hint">未获取</span> 
+          <button id="proxyUrlBtn" class="btn secondary" type="button" style="margin-left:8px">获取地址</button>
+          <button id="copyProxyBtn" class="btn secondary" type="button" style="margin-left:4px;display:none">复制</button>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px">提示：透传地址用于将外网请求转发到本地API。将此地址配置到影视+的站源API中即可实现远程访问。</div>
+
+      <div class="controls">
+        <button id="saveBtn" class="btn">保存设置</button>
+        <button id="reloadBtn" class="btn secondary" onclick="load()">刷新</button>
+      </div>
+      <div id="status" class="hint" style="color:green;margin-top:12px"></div>
+    </div>
+  </div>
+
+<script>
+function httpGet(url, cb){
+  var xhr=new XMLHttpRequest();xhr.open('GET',url,true);xhr.onreadystatechange=function(){if(xhr.readyState===4){cb(xhr.status,xhr.responseText);}};xhr.send(null);
+}
+function httpPost(url, data, cb){
+  var xhr=new XMLHttpRequest();xhr.open('POST',url,true);xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');xhr.onreadystatechange=function(){if(xhr.readyState===4){cb(xhr.status,xhr.responseText);}};xhr.send(data);
+}
+
+function load(){
+  httpGet('/config/settings', function(s, t){
+    if (s!==200) return;
+    try{var j=JSON.parse(t);
+  // 填充可编辑 Site Key（若为空表示使用默认）
+  document.getElementById('siteKey').value = j.site || '';
+  setToggle('raw', !!j.raw);
+  setToggle('style', !!j.style);
+  setToggle('filters', !!j.filters);
+  setToggle('playProxy', !!j.playProxy);
+  setToggle('rewritePlayUrl', !!j.rewritePlayUrl);
+  setToggle('siteMenu', !!j.siteMenu);
+      document.getElementById('sniffKeywords').value=j.sniffKeywords||'';
+      document.getElementById('sniffHeaders').value=j.sniffHeaders||'';
+      document.getElementById('sniffJs').value=j.sniffJs||'';
+      document.getElementById('wsUrl').value=j.wsUrl||'';
+  setToggle('wsAuto', !!j.wsAutoConnect);
+    }catch(e){}
+  });
+  // 加载后刷新 WS 状态
+  refreshWsStatus();
+}
+
+function save(){
+  var params=[];
+  params.push('raw=' + (getToggle('raw')?1:0));
+  params.push('style=' + (getToggle('style')?1:0));
+  params.push('filters=' + (getToggle('filters')?1:0));
+  params.push('playProxy=' + (getToggle('playProxy')?1:0));
+  params.push('rewritePlayUrl=' + (getToggle('rewritePlayUrl')?1:0));
+  params.push('siteMenu=' + (getToggle('siteMenu')?1:0));
+  params.push('sniffKeywords=' + encodeURIComponent(document.getElementById('sniffKeywords').value));
+  params.push('sniffHeaders=' + encodeURIComponent(document.getElementById('sniffHeaders').value));
+  params.push('sniffJs=' + encodeURIComponent(document.getElementById('sniffJs').value));
+  params.push('wsUrl=' + encodeURIComponent(document.getElementById('wsUrl').value));
+  params.push('wsAutoConnect=' + (getToggle('wsAuto')?1:0));
+  // siteKey 可以为空，表示清空覆盖
+  params.push('site=' + encodeURIComponent(document.getElementById('siteKey').value));
+  var body = params.join('&');
+  httpPost('/config/settings', body, function(s,t){
+    var st = document.getElementById('status');
+    if (s===200){st.style.color='green';st.innerText='保存成功';setTimeout(function(){st.innerText='';},2000);} else {st.style.color='red';st.innerText='保存失败';}
+  });
+}
+
+function setToggle(id, on){
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.checked = !!on;
+  var wrap = el.closest('.toggle');
+  if (wrap){ if (on) wrap.classList.add('on'); else wrap.classList.remove('on'); }
+}
+
+function getToggle(id){ var el = document.getElementById(id); return el && el.checked; }
+
+document.querySelectorAll('.toggle input').forEach(function(chk){ chk.addEventListener('change', function(e){ var wrap = chk.closest('.toggle'); if (wrap){ if (chk.checked) wrap.classList.add('on'); else wrap.classList.remove('on'); } }); });
+document.getElementById('saveBtn').addEventListener('click', save);
+  document.getElementById('wsCheckBtn').addEventListener('click', function(){
+    var url = document.getElementById('wsUrl').value || '';
+    if (!url) { var st=document.getElementById('status'); st.style.color='red'; st.innerText='请输入 WS 地址'; setTimeout(function(){st.innerText='';},2000); return; }
+    var st=document.getElementById('status'); st.style.color='#333'; st.innerText='测试中...';
+    httpGet('/config/ws_check?wsUrl=' + encodeURIComponent(url), function(s,t){ try{ if (s===200){ var j=JSON.parse(t); st.style.color='green'; st.innerText=j.msg||'连接成功'; } else { st.style.color='red'; st.innerText='连接失败'; } }catch(e){ st.style.color='red'; st.innerText='检测异常'; } setTimeout(function(){st.innerText='';},4000); });
+  });
+  document.getElementById('wsStatusBtn').addEventListener('click', refreshWsStatus);
+  document.getElementById('proxyUrlBtn').addEventListener('click', refreshProxyUrl);
+  document.getElementById('copyProxyBtn').addEventListener('click', copyProxyUrl);
+  
+  function refreshWsStatus(){
+    var st=document.getElementById('wsStatus'); st.innerText='检测中...'; st.style.color='#333';
+    httpGet('/config/ws_status', function(s,t){ try{ if (s===200){ var j=JSON.parse(t); if (j.connected){ st.style.color='green'; st.innerText='已连接: ' + (j.url||''); refreshProxyUrl(); } else { st.style.color='red'; st.innerText='未连接'; } } else { st.style.color='red'; st.innerText='状态获取失败'; } }catch(e){ st.style.color='red'; st.innerText='解析错误'; } });
+  }
+
+  function refreshProxyUrl(){
+    var st=document.getElementById('proxyUrl'); st.innerText='获取中...'; st.style.color='#333';
+    var copyBtn = document.getElementById('copyProxyBtn');
+    copyBtn.style.display='none';
+    
+    // 从本地获取透传地址
+    httpGet('/config/proxy_url', function(s,t){ 
+      try{ 
+        if (s===200){ 
+          var j=JSON.parse(t); 
+          if (j.connected && j.proxy_url){ 
+            st.style.color='green'; 
+            st.innerText=j.proxy_url; 
+            st.setAttribute('data-url', j.proxy_url);
+            copyBtn.style.display='inline-block';
+            if (j.multi_mode) {
+              st.innerText += ' (多客户端模式)';
+            }
+          } else { 
+            st.style.color='red'; 
+            st.innerText='未连接到远程服务器'; 
+          } 
+        } else { 
+          st.style.color='red'; 
+          st.innerText='获取失败'; 
+        } 
+      }catch(e){ 
+        st.style.color='red'; 
+        st.innerText='解析错误'; 
+      } 
+    });
+  }
+
+  function copyProxyUrl(){
+    var st=document.getElementById('proxyUrl');
+    var url = st.getAttribute('data-url');
+    if (!url) return;
+    
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(url).then(function(){
+        var msg=document.getElementById('status'); 
+        msg.style.color='green'; 
+        msg.innerText='地址已复制'; 
+        setTimeout(function(){msg.innerText='';},2000);
+      });
+    } else {
+      // 降级方案
+      var textarea = document.createElement('textarea');
+      textarea.value = url;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      
+      var msg=document.getElementById('status'); 
+      msg.style.color='green'; 
+      msg.innerText='地址已复制'; 
+      setTimeout(function(){msg.innerText='';},2000);
+    }
+  }
+
+window.onload = load;
+</script>
+</body>
+</html>

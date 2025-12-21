@@ -1,0 +1,1932 @@
+package com.fongmi.android.tv.server.process;
+
+import android.text.TextUtils;
+
+import com.fongmi.android.tv.api.config.LiveConfig;
+import com.fongmi.android.tv.api.config.VodConfig;
+import com.fongmi.android.tv.bean.Config;
+import com.fongmi.android.tv.bean.Live;
+import com.fongmi.android.tv.bean.Result;
+import com.fongmi.android.tv.bean.Site;
+import com.fongmi.android.tv.bean.Vod;
+import com.fongmi.android.tv.model.SiteViewModel;
+import com.fongmi.android.tv.server.Nano;
+import com.fongmi.android.tv.server.impl.Process;
+import com.fongmi.android.tv.utils.Sniffer;
+import com.github.catvod.crawler.Spider;
+import com.github.catvod.utils.Json;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.fongmi.android.tv.player.Source;
+import com.fongmi.android.tv.bean.Url;
+import com.github.catvod.utils.Prefers;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.security.MessageDigest;
+import java.util.Locale;
+import java.util.Random;
+import java.util.Iterator;
+
+import fi.iki.elonen.NanoHTTPD;
+
+public class Api implements Process {
+
+    private final com.google.gson.Gson gson = new com.google.gson.GsonBuilder().disableHtmlEscaping().create();
+    // 当前请求的页码（由 handleApiRequest 设置），用于统一响应字段
+    private final ThreadLocal<String> currentPg = new ThreadLocal<>();
+    // 简单的代理 ID 映射表（id -> ProxyEntry）
+    private static final ConcurrentHashMap<String, ProxyEntry> PROXY_MAP = new ConcurrentHashMap<>();
+    private static final long PROXY_TTL_MS = 10 * 60 * 1000; // 10 分钟
+
+    private static class ProxyEntry {
+        String url;
+        long expiry;
+        Map<String, String> headers;
+
+        ProxyEntry(String url, long expiry, Map<String, String> headers) {
+            this.url = url;
+            this.expiry = expiry;
+            this.headers = headers;
+        }
+    }
+
+    // 将一个长 URL 存为短 id，返回 id（带更低冲突概率的 UUID 前缀）
+    private String storeProxyUrl(String url) {
+        return storeProxyUrl(url, null);
+    }
+
+    private String resolveProxyId(String id) {
+        ProxyEntry entry = PROXY_MAP.get(id);
+        if (entry == null) return null;
+        if (System.currentTimeMillis() > entry.expiry) {
+            PROXY_MAP.remove(id);
+            return null;
+        }
+        return entry.url;
+    }
+
+    // 获取完整的 ProxyEntry（包含 headers），用于代理请求时重放头信息
+    private ProxyEntry resolveProxyEntry(String id) {
+        ProxyEntry entry = PROXY_MAP.get(id);
+        if (entry == null) return null;
+        if (System.currentTimeMillis() > entry.expiry) {
+            PROXY_MAP.remove(id);
+            return null;
+        }
+        return entry;
+    }
+
+    // 存储时附带 headers
+    private String storeProxyUrl(String url, Map<String, String> headers) {
+        try {
+            // 使用 UUID + 时间戳组合生成短 id，长度约为16字符
+            String uuid = java.util.UUID.randomUUID().toString().replace("-", "");
+            String id = uuid.substring(0, 12) + Long.toHexString(System.currentTimeMillis() & 0xffff);
+            long expiry = System.currentTimeMillis() + PROXY_TTL_MS;
+            PROXY_MAP.put(id, new ProxyEntry(url, expiry, headers == null ? null : new HashMap<>(headers)));
+            // 清理过期项
+            cleanupProxyMap();
+            return id;
+        } catch (Exception e) {
+            return Long.toHexString(System.currentTimeMillis());
+        }
+    }
+
+    private void cleanupProxyMap() {
+        long now = System.currentTimeMillis();
+        Iterator<Map.Entry<String, ProxyEntry>> it = PROXY_MAP.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, ProxyEntry> e = it.next();
+            if (e.getValue().expiry < now) it.remove();
+        }
+    }
+
+    @Override
+    public boolean isRequest(NanoHTTPD.IHTTPSession session, String url) {
+        return url.startsWith("/vod/") || url.startsWith("/config/") || url.startsWith("/live") || url.startsWith("/index.php/");
+    }
+
+    // 智能站点查找 - 支持多种key格式
+    private Site findSiteByKey(String requestedKey) {
+        List<Site> allSites = VodConfig.get().getSites();
+        
+        // 1. 精确匹配
+        for (Site site : allSites) {
+            if (site.getKey().equals(requestedKey)) {
+                return site;
+            }
+        }
+        
+        // 2. 忽略大小写匹配
+        for (Site site : allSites) {
+            if (site.getKey().equalsIgnoreCase(requestedKey)) {
+                return site;
+            }
+        }
+        
+        // 3. 去掉前缀匹配 (csp_SP360 -> SP360, 360)
+        String withoutPrefix = requestedKey.replaceFirst("^csp_", "");
+        for (Site site : allSites) {
+            if (site.getKey().equals(withoutPrefix) || site.getKey().equalsIgnoreCase(withoutPrefix)) {
+                return site;
+            }
+        }
+                
+        // 5. 名称匹配
+        String lowerRequested = requestedKey.toLowerCase();
+        for (Site site : allSites) {
+            String lowerSiteName = site.getName().toLowerCase();
+            if (lowerSiteName.contains(lowerRequested) || lowerRequested.contains(lowerSiteName)) {
+                return site;
+            }
+        }
+        
+        // 6. 返回空站点
+        return new Site();
+    }
+
+    @Override
+    public NanoHTTPD.Response doResponse(NanoHTTPD.IHTTPSession session, String url, Map<String, String> files) {
+        try {
+            // 如果是预检请求，直接返回带 CORS 的空 JSON 响应
+            if (session.getMethod() == NanoHTTPD.Method.OPTIONS) {
+                NanoHTTPD.Response options = createJsonResponse(new JsonObject());
+                options.addHeader("Access-Control-Allow-Origin", "*");
+                options.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+                options.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+                return options;
+            }
+
+            // 非预检请求，正常处理并在返回前添加 CORS 头
+            NanoHTTPD.Response response = handleApiRequest(session, url, files);
+            response.addHeader("Access-Control-Allow-Origin", "*");
+            response.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            response.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+            return response;
+        } catch (Exception e) {
+            NanoHTTPD.Response err = createErrorResponse(500, "内部服务器错误：" + (e == null ? "" : e.getMessage()));
+            err.addHeader("Access-Control-Allow-Origin", "*");
+            err.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            err.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+            return err;
+        }
+    }
+
+    private NanoHTTPD.Response handleApiRequest(NanoHTTPD.IHTTPSession session, String url, Map<String, String> files) throws Exception {
+        Map<String, String> params = new HashMap<>();
+        
+        // 从 URL 中提取路径部分（去掉查询字符串）
+        if (url != null && url.contains("?")) {
+            url = url.split("\\?")[0];
+        }
+        
+        // 解析GET参数（支持 key 或 key= 或 key=value）
+        String rawQuery = session.getQueryParameterString();
+        if (rawQuery != null) {
+            String[] pairs = rawQuery.split("&");
+            for (String pair : pairs) {
+                if (pair == null || pair.isEmpty()) continue;
+                String[] keyValue = pair.split("=", 2);
+                if (keyValue.length == 2) {
+                    params.put(URLDecoder.decode(keyValue[0], "UTF-8"), 
+                              URLDecoder.decode(keyValue[1], "UTF-8"));
+                } else if (keyValue.length == 1) {
+                    // key without '=' -> treat as present with empty value
+                    params.put(URLDecoder.decode(keyValue[0], "UTF-8"), "");
+                }
+            }
+            // 保存原始 query 到 params 以便后续逻辑区分 key 与 key=
+            params.put("__raw_query", rawQuery);
+        }
+        
+        // 解析POST参数
+        if (files.containsKey("postData")) {
+            String postData = files.get("postData");
+            if (postData != null && !postData.isEmpty()) {
+                String[] pairs = postData.split("&");
+                for (String pair : pairs) {
+                    String[] keyValue = pair.split("=", 2);
+                    if (keyValue.length == 2) {
+                        params.put(URLDecoder.decode(keyValue[0], "UTF-8"), 
+                                  URLDecoder.decode(keyValue[1], "UTF-8"));
+                    }
+                }
+            }
+        }
+
+        // 注入当前请求的 Host (用于生成完整的代理地址 如 http://ip:port)
+        try {
+            Map<String, String> sessionHeaders = session.getHeaders();
+            if (sessionHeaders != null) {
+                String hostHeader = sessionHeaders.get("host");
+                if (!TextUtils.isEmpty(hostHeader)) {
+                    // 使用 http 作为默认 scheme
+                    params.put("_server", "http://" + hostHeader);
+                }
+            }
+        } catch (Exception ignored) {}
+        // 兼容 ext 参数：ext 与 f 等价，ext 可能为 base64 编码，优先解码并赋值给 f
+        try {
+            String ext = params.get("ext");
+            if (!TextUtils.isEmpty(ext)) {
+                String fvalue = ext;
+                try {
+                    // 尝试 base64 解码
+                    byte[] decoded = java.util.Base64.getDecoder().decode(ext);
+                    String decodedStr = new String(decoded, "UTF-8");
+                    if (decodedStr.trim().startsWith("{")) fvalue = decodedStr;
+                } catch (IllegalArgumentException ignored) {
+                    // 不是 base64，直接使用 ext
+                }
+                // 覆盖或设置 f
+                params.put("f", fvalue);
+            }
+        } catch (Exception ignored) {}
+        
+    // 将当前页注入到 ThreadLocal，便于统一响应处理
+    currentPg.set(params.getOrDefault("pg", "1"));
+
+    try {
+    // 路由处理
+    if (url.equals("/vod/api")) {
+            return handleCollectorApi(params);
+        }
+
+        // 兼容采集站：伪接口 /index.php/ajax/data.html
+        // 将 tid -> t, page -> pg，忽略 mid 和 limit
+        if (url.equals("/index.php/ajax/data.html")) {
+            // 将 tid 转为 t
+            String tid = params.get("tid");
+            if (!TextUtils.isEmpty(tid)) params.put("t", tid);
+            // 将 page 转为 pg
+            String page = params.get("page");
+            if (!TextUtils.isEmpty(page)) params.put("pg", page);
+            // 强制视为列表请求，方便兼容采集站
+            params.put("ac", "list");
+            // 忽略 mid 和 limit（无视或保留均可）
+            return handleCollectorApi(params);
+        }
+        
+        if (url.equals("/config/sites")) {
+            return handleGetAllSites();
+        }
+        
+        if (url.equals("/config/lives")) {
+            return handleGetAllLives();
+        }
+        
+        if (url.equals("/config/site")) {
+            return handleGetSite(params);
+        }
+        
+        if (url.equals("/config/live")) {
+            return handleGetLive(params);
+        }
+        
+        if (url.equals("/live")) {
+            return handleLiveStream(params);
+        }
+        
+        if (url.equals("/vod/sniff")) {
+            return handleSniff(params);
+        }
+
+        if (url.equals("/vod/proxy")) {
+            return handleProxy(session, params);
+        }
+        // 动态覆盖当前 site（仅临时覆盖，不修改 APK 内置配置）
+        if (url.equals("/config/settings")) {
+            return handleSettings(params);
+        }
+        
+        return createErrorResponse(404, "未找到 API 接口");
+        } finally {
+            currentPg.remove();
+        }
+    }
+
+    // 简单代理：将上游响应流式转发给客户端，保留关键响应头并支持 Range
+    private NanoHTTPD.Response handleProxy(NanoHTTPD.IHTTPSession session, Map<String, String> params) {
+        String id = params.get("id");
+        String target = null;
+        ProxyEntry storedEntry = null;
+        if (!TextUtils.isEmpty(id)) {
+            // 通过 id 解析原始 URL 并获取保存的 headers
+            storedEntry = resolveProxyEntry(id);
+            if (storedEntry == null) return createErrorResponse(404, "代理 id 未找到或已过期");
+            target = storedEntry.url;
+        } else {
+            target = params.get("url");
+            if (TextUtils.isEmpty(target)) return createErrorResponse(400, "缺少 url 或 id 参数");
+        }
+
+        try {
+            // 基本白名单检查（可扩展为配置项）
+            java.net.URI uri = new java.net.URI(target);
+            String host = uri.getHost();
+
+            // 构建上游连接
+            URL upstream = new URL(target);
+            HttpURLConnection conn = (HttpURLConnection) upstream.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(30000);
+            conn.setInstanceFollowRedirects(true);
+
+            // 优先使用存储的 headers（如果有），再回退到请求头中的值（存储的优先）
+            Map<String, String> sessionHeaders = session.getHeaders();
+            java.util.Set<String> storedLower = new java.util.HashSet<>();
+            if (storedEntry != null && storedEntry.headers != null) {
+                for (Map.Entry<String, String> e : storedEntry.headers.entrySet()) {
+                    try {
+                        conn.setRequestProperty(e.getKey(), e.getValue());
+                        storedLower.add(e.getKey().toLowerCase());
+                    } catch (Exception ignored) {}
+                }
+            }
+            if (sessionHeaders != null) {
+                String range = sessionHeaders.get("range");
+                if (!TextUtils.isEmpty(range) && !storedLower.contains("range")) conn.setRequestProperty("Range", range);
+                String ua = sessionHeaders.get("user-agent");
+                if (!TextUtils.isEmpty(ua) && !storedLower.contains("user-agent")) conn.setRequestProperty("User-Agent", ua);
+                String ref = sessionHeaders.get("referer");
+                if (!TextUtils.isEmpty(ref) && !storedLower.contains("referer")) conn.setRequestProperty("Referer", ref);
+                String cookie = sessionHeaders.get("cookie");
+                if (!TextUtils.isEmpty(cookie) && !storedLower.contains("cookie")) conn.setRequestProperty("Cookie", cookie);
+            }
+
+            int code = conn.getResponseCode();
+            String contentType = conn.getContentType();
+            String contentLength = conn.getHeaderField("Content-Length");
+            String acceptRanges = conn.getHeaderField("Accept-Ranges");
+            String contentRange = conn.getHeaderField("Content-Range");
+
+            // 强判 m3u8：根据 Content-Type、URL 特征或文件内容首行判断
+            boolean isM3u8 = false;
+            if (contentType != null) {
+                String ct = contentType.toLowerCase();
+                if (ct.contains("mpegurl") || ct.contains("application/x-mpegurl") || ct.contains("vnd.apple")) isM3u8 = true;
+            }
+            if (!isM3u8 && target.toLowerCase().contains(".m3u8")) isM3u8 = true;
+
+            java.io.InputStream rawInput = null;
+            try {
+                rawInput = conn.getInputStream();
+            } catch (Exception e) {
+                rawInput = conn.getErrorStream();
+            }
+
+            if (rawInput == null) {
+                return createErrorResponse(502, "上游返回空响应，状态码=" + code);
+            }
+
+            if (!isM3u8) {
+                // 进一步检查文件开头是否为 M3U8 标识
+                rawInput = new java.io.BufferedInputStream(rawInput);
+                rawInput.mark(8192);
+                byte[] head = new byte[8192];
+                int read = rawInput.read(head);
+                String headStr = "";
+                if (read > 0) {
+                    try {
+                        headStr = new String(head, 0, Math.min(read, 8192), "UTF-8");
+                    } catch (Exception ignored) {
+                        headStr = new String(head, 0, Math.min(read, 8192));
+                    }
+                    if (headStr.startsWith("#EXTM3U") || headStr.contains("#EXTINF")) isM3u8 = true;
+                }
+                rawInput.reset();
+            }
+
+            if (isM3u8) {
+                // 读取文本并重写每行引用为代理地址；为每个片段生成短 id 并保存对应 headers
+                java.io.BufferedReader br = new java.io.BufferedReader(new InputStreamReader(rawInput, "UTF-8"));
+                String line;
+                StringBuilder outText = new StringBuilder();
+                while ((line = br.readLine()) != null) {
+                    if (line.trim().isEmpty() || line.startsWith("#")) {
+                        outText.append(line).append('\n');
+                        continue;
+                    }
+                    // 解析相对或绝对 URL
+                    try {
+                        URL resolved = new URL(upstream, line.trim());
+                        String segUrl = resolved.toString();
+                        // 合并 headers：优先使用 storedEntry.headers，其次使用当前请求头
+                        Map<String, String> segHeaders = new HashMap<>();
+                        if (storedEntry != null && storedEntry.headers != null) segHeaders.putAll(storedEntry.headers);
+                        if (sessionHeaders != null) {
+                            String ua = sessionHeaders.get("user-agent"); if (!TextUtils.isEmpty(ua)) segHeaders.putIfAbsent("User-Agent", ua);
+                            String ref = sessionHeaders.get("referer"); if (!TextUtils.isEmpty(ref)) segHeaders.putIfAbsent("Referer", ref);
+                            String cookie = sessionHeaders.get("cookie"); if (!TextUtils.isEmpty(cookie)) segHeaders.putIfAbsent("Cookie", cookie);
+                        }
+                        String sid = storeProxyUrl(segUrl, segHeaders);
+                        String proxied = "/vod/proxy?id=" + sid;
+                        outText.append(proxied).append('\n');
+                    } catch (Exception e) {
+                        outText.append(line).append('\n');
+                    }
+                }
+                br.close();
+                byte[] bytes = outText.toString().getBytes("UTF-8");
+                NanoHTTPD.Response resp = NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.lookup(code), contentType == null ? "application/vnd.apple.mpegurl" : contentType, new java.io.ByteArrayInputStream(bytes), bytes.length);
+                if (acceptRanges != null) resp.addHeader("Accept-Ranges", acceptRanges);
+                if (contentLength != null) resp.addHeader("Content-Length", String.valueOf(bytes.length));
+                return resp;
+            }
+
+            // 非 m3u8，直接流式转发
+            java.io.InputStream input = rawInput;
+            NanoHTTPD.Response response = NanoHTTPD.newChunkedResponse(NanoHTTPD.Response.Status.lookup(code), contentType == null ? "application/octet-stream" : contentType, input);
+            if (contentLength != null) response.addHeader("Content-Length", contentLength);
+            if (acceptRanges != null) response.addHeader("Accept-Ranges", acceptRanges);
+            if (contentRange != null) response.addHeader("Content-Range", contentRange);
+            String cacheControl = conn.getHeaderField("Cache-Control");
+            if (cacheControl != null) response.addHeader("Cache-Control", cacheControl);
+            String etag = conn.getHeaderField("ETag");
+            if (etag != null) response.addHeader("ETag", etag);
+
+            return response;
+        } catch (Throwable e) {
+            return createErrorResponse(500, "代理失败：" + (e == null ? "" : e.getMessage()));
+        }
+    }
+
+    // 核心采集站兼容API - 完全兼容type=1采集站
+    private NanoHTTPD.Response handleCollectorApi(Map<String, String> params) throws Exception {
+        // 兼容：优先使用请求中的 site 参数（旧客户端），否则使用动态 override 或 APK 内置 home
+        String siteKey = params.get("site");
+        Site site;
+        if (!TextUtils.isEmpty(siteKey)) {
+            site = findSiteByKey(siteKey);
+            if (site == null || site.isEmpty()) return createErrorResponse(404, "未找到站点：" + siteKey);
+        } else {
+            site = getActiveSite();
+            if (site == null || site.isEmpty()) return createErrorResponse(400, "缺少 site 参数，且没有可用的活动站点");
+        }
+        
+        String ac = params.get("ac");
+        String wd = params.get("wd");
+
+        // 搜索功能 - 必须同时有wd参数（site 可为空以使用默认 active site）
+        if (!TextUtils.isEmpty(wd)) return handleSearch(site, params);
+
+        // 播放链接获取
+        if ("play".equals(ac)) return handlePlay(site, params);
+
+        // 列表查询 - ac=list 返回简化的视频列表
+        if ("list".equals(ac)) return handleList(site, params);
+
+        // 优先 ids 参数：如果传 ids，返回详情（可能与 t 组合）
+        String ids = params.get("ids");
+        String t = params.get("t");
+        String f = params.get("f");
+
+        // 如果有 ids，返回对应详情；如果同时有 t，则在该分类上下文中返回（即确保资源属于该分类）
+        if (!TextUtils.isEmpty(ids)) {
+            // 对于 HTTP 站点，需确保 API 可用
+            if (site.getType() != 3 && TextUtils.isEmpty(site.getApi())) {
+                return createErrorResponse(400, "活动站点未配置 API；请提供 site 参数或通过 /config/override_site?set=KEY 设置覆盖站点");
+            }
+            // 如果指定了分类 t，则尝试在该分类下查找并返回详情（如果找不到，仍然返回普通 detail）
+            if (!TextUtils.isEmpty(t)) {
+                try {
+                    return handleDetailWithCategory(site, t, ids, params);
+                } catch (Exception e) {
+                    return createErrorResponse(502, "详情获取失败：" + (e == null ? "" : e.getMessage()));
+                }
+            }
+            try {
+                return handleDetail(site, ids);
+            } catch (NullPointerException npe) {
+                return createErrorResponse(502, "上游返回无效的 JSON（空对象）；请检查站点 API 或使用显式的 site 参数");
+            }
+        }
+
+        // 分类列表或筛选：t 表示分类，如果存在 t 则返回该分类的列表（不返回 class 字段）
+        if (!TextUtils.isEmpty(t)) {
+            String pg = params.getOrDefault("pg", "1");
+            // 解析全局筛选 f（可能已通过 ext 赋值）
+            java.util.Map<String, String> filters = parseFilters(params.get("f"));
+            return handleCategoryApi(site, t, pg, filters, params);
+        }
+
+        // 全局筛选（无 t），按 f 返回过滤后的默认列表
+        if (!TextUtils.isEmpty(f)) {
+            java.util.Map<String, String> filters = parseFilters(f);
+            // 使用首页数据进行筛选并返回
+            try {
+                com.fongmi.android.tv.bean.Result home = performHome(site);
+                com.fongmi.android.tv.bean.Result filtered = fetchPic(site, applyFiltersToResult(home, filters));
+                JsonObject response = new JsonObject();
+                JsonArray list = new JsonArray();
+                for (Vod vod : filtered.getList()) list.add(vodToJson(vod));
+                response.add("list", list);
+                response.add("style", getStyleJson(filtered, site));
+                
+                // 修复分页字段逻辑
+                int limit = list.size() != 20 ? list.size() : 20;  // 根据实际 list 大小调整 limit
+                int pagecount = filtered.getPageCount() > 0 ? filtered.getPageCount() : 9999;
+                int total = pagecount * limit;  // total = pagecount * limit
+                
+                response.addProperty("page", 1);
+                response.addProperty("pagecount", pagecount);
+                response.addProperty("limit", limit);
+                response.addProperty("total", total);
+                response.add("raw", siteToJson(site));
+                return createJsonResponse(response);
+            } catch (Exception e) {
+                return createErrorResponse(500, "筛选失败：" + (e == null ? "" : e.getMessage()));
+            }
+        }
+
+        // 默认返回首页（已包含分类和列表）
+        return handleHome(site);
+    }
+
+    // 解析 f 参数（JSON），返回键值映射
+    private java.util.Map<String, String> parseFilters(String f) {
+        java.util.Map<String, String> map = new java.util.HashMap<>();
+        if (TextUtils.isEmpty(f)) return map;
+        try {
+            com.google.gson.JsonObject obj = com.github.catvod.utils.Json.parse(f).getAsJsonObject();
+            for (Map.Entry<String, com.google.gson.JsonElement> e : obj.entrySet()) {
+                map.put(e.getKey(), e.getValue().getAsString());
+            }
+        } catch (Exception ignored) {}
+        return map;
+    }
+
+    // 在指定分类下获取详情（先获取分类列表并匹配 ids）
+    private NanoHTTPD.Response handleDetailWithCategory(Site site, String tid, String ids, Map<String, String> params) throws Exception {
+        // 获取该分类的列表
+        String pg = params.getOrDefault("pg", "1");
+        com.fongmi.android.tv.bean.Result cat = performCategory(site, tid, pg, new java.util.HashMap<>());
+        if (cat.getList().isEmpty()) {
+            // 如果该分类没有数据，则回退到普通 detail
+            return handleDetail(site, ids);
+        }
+        // 请求的 ids 可能为逗号分隔的多个 id
+        java.util.Set<String> idSet = new java.util.HashSet<>(Arrays.asList(ids.split(",")));
+        java.util.List<Vod> matched = new java.util.ArrayList<>();
+        for (Vod v : cat.getList()) if (idSet.contains(v.getVodId())) matched.add(v);
+        if (matched.isEmpty()) {
+            // 回退到普通 detail
+            return handleDetail(site, ids);
+        }
+        // 构造结果
+        JsonObject response = new JsonObject();
+        JsonArray list = new JsonArray();
+        for (Vod v : matched) list.add(vodToJson(v));
+        response.add("list", list);
+        response.add("style", getStyleJson(cat, site));
+        response.add("raw", siteToJson(site));
+        return createJsonResponse(response);
+    }
+
+    // 将 filters 应用于 Result，返回新的 Result（只做简单属性匹配）
+    private com.fongmi.android.tv.bean.Result applyFiltersToResult(com.fongmi.android.tv.bean.Result src, java.util.Map<String, String> filters) {
+        if (filters == null || filters.isEmpty()) return src;
+        com.fongmi.android.tv.bean.Result out = new com.fongmi.android.tv.bean.Result();
+        for (Vod v : src.getList()) {
+            boolean keep = true;
+            for (Map.Entry<String, String> e : filters.entrySet()) {
+                String key = e.getKey();
+                String val = e.getValue();
+                // 简单支持 match 于 vod 的若干字段
+                String field = "";
+                if ("typeName".equalsIgnoreCase(key) || "type".equalsIgnoreCase(key)) field = v.getTypeName();
+                else if ("vod_actor".equalsIgnoreCase(key) || "actor".equalsIgnoreCase(key)) field = v.getVodActor();
+                else if ("vod_director".equalsIgnoreCase(key) || "director".equalsIgnoreCase(key)) field = v.getVodDirector();
+                else if ("vod_year".equalsIgnoreCase(key) || "year".equalsIgnoreCase(key)) field = v.getVodYear();
+                else if ("vod_tag".equalsIgnoreCase(key) || "tag".equalsIgnoreCase(key)) field = v.getVodTag();
+                else field = "";
+                if (!TextUtils.isEmpty(field) && !field.contains(val)) { keep = false; break; }
+            }
+            if (keep) out.getList().add(v);
+        }
+        return out;
+    }
+
+    // 返回分类的 API（不包含 class 字段）
+    private NanoHTTPD.Response handleCategoryApi(Site site, String t, String pg, java.util.Map<String, String> filters, Map<String, String> params) throws Exception {
+        com.fongmi.android.tv.bean.Result result = performCategory(site, t, pg, new java.util.HashMap<>());
+        if (!filters.isEmpty()) result = applyFiltersToResult(result, filters);
+        JsonObject response = new JsonObject();
+        JsonArray list = new JsonArray();
+        for (Vod vod : result.getList()) list.add(vodToJson(vod));
+        response.add("list", list);
+        response.add("style", getStyleJson(result, site));
+        
+        // 修复分页字段逻辑
+        int page = Integer.parseInt(pg);
+        if (page == 0) page = 1;  // page=0 转换为 page=1
+        int limit = list.size() != 20 ? list.size() : 20;  // 根据实际 list 大小调整 limit
+        int pagecount = result.getPageCount() > 0 ? result.getPageCount() : 9999;
+        int total = pagecount * limit;  // total = pagecount * limit
+        
+        response.addProperty("page", page);
+        response.addProperty("pagecount", pagecount);
+        response.addProperty("limit", limit);
+        response.addProperty("total", total);
+        response.add("raw", siteToJson(site));
+        return createJsonResponse(response);
+    }
+
+    // 获取当前活动 site：优先使用 Prefers 中的临时覆盖，否则使用 VodConfig 的 home
+    private Site getActiveSite() {
+        try {
+            String override = Prefers.getString("api_override_site");
+            if (!TextUtils.isEmpty(override)) {
+                Site s = VodConfig.get().getSite(override);
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Exception ignored) {}
+        // 尝试使用 VodConfig 的 home（正常情况）
+        Site home = VodConfig.get().getHome();
+        if (home != null && !home.isEmpty()) return home;
+
+        // 如果 VodConfig 还没加载好，退而求其次：从持久化的 Config.vod() 中读取 home key 并解析为 Site
+        try {
+            String homeKey = com.fongmi.android.tv.bean.Config.vod().getHome();
+            if (!TextUtils.isEmpty(homeKey)) {
+                Site s = VodConfig.get().getSite(homeKey);
+                if (s != null && !s.isEmpty()) return s;
+            }
+        } catch (Exception ignored) {}
+
+        // 最后回退到 sites 列表中的第一个
+        List<Site> sites = VodConfig.get().getSites();
+        if (sites != null && !sites.isEmpty()) return sites.get(0);
+        return new Site();
+    }
+
+    // 新的配置接口：/config/settings - 严格按用户要求实现
+    // 0: 默认返回当前 site、raw、style、filters 状态
+    // 2: ?site= 清空覆盖
+    // 3: ?site=xxx 设置覆盖（临时，不持久化）
+    // 4: ?raw=0/1 控制 raw 字段输出（持久化）
+    // 5: ?style=0/1 控制 style 字段输出（持久化）
+    // 6: ?filters=0/1 控制 filters 字段输出（持久化）
+    private NanoHTTPD.Response handleSettings(Map<String, String> params) {
+        JsonObject json = new JsonObject();
+        
+        // 统一的切换参数处理函数（用于 raw、style、filters 等可扩展的 0/1 切换参数）
+        // 返回 null 表示该参数不存在，否则返回响应对象
+        java.util.function.Function<String, NanoHTTPD.Response> handleToggleParam = paramName -> {
+            String value = params.get(paramName);
+            if (value == null) return null; // 参数不存在
+            
+            String normalized = value.equals("1") ? "1" : "0";
+            Prefers.put("api_settings_" + paramName, normalized);
+            
+            JsonObject resp = new JsonObject();
+            resp.addProperty("code", 1);
+            String msgFieldName = paramName.equals("raw") ? "raw字段" : 
+                                  (paramName.equals("style") ? "style字段" : 
+                                   (paramName.equals("filters") ? "filters字段" : paramName + "字段"));
+            resp.addProperty("msg", normalized.equals("1") ? "已开启" + msgFieldName + "的输出" : "已关闭" + msgFieldName + "的输出");
+            
+            try {
+                String jsonStr = gson.toJson(resp);
+                byte[] bytes = jsonStr.getBytes("UTF-8");
+                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json; charset=utf-8", new java.io.ByteArrayInputStream(bytes), bytes.length);
+            } catch (java.io.UnsupportedEncodingException e) {
+                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "");
+            }
+        };
+        
+        // 优先处理切换参数（raw、style、filters 等）
+        NanoHTTPD.Response toggleResp = handleToggleParam.apply("raw");
+        if (toggleResp != null) return toggleResp;
+        
+        toggleResp = handleToggleParam.apply("style");
+        if (toggleResp != null) return toggleResp;
+        
+        toggleResp = handleToggleParam.apply("filters");
+        if (toggleResp != null) return toggleResp;
+        
+        // 再处理 site 参数
+        String siteParam = params.get("site"); // null if absent, "" if site=, "xxx" if site=xxx
+        if (siteParam != null) {
+            if (siteParam.isEmpty()) {
+                // 规则 2: ?site= 清空覆盖，恢复默认
+                Prefers.put("api_override_site", "");
+                String def = getActiveSite().getKey();
+                json.addProperty("code", 1);
+                json.addProperty("msg", "已恢复壳子默认数据源 【" + def + "】");
+                return createJsonResponse(json);
+            } else {
+                // 规则 3: ?site=xxx 设置覆盖（临时，不持久化）
+                Site s = VodConfig.get().getSite(siteParam);
+                String name = (s != null && !s.isEmpty()) ? s.getName() : siteParam;
+                Prefers.put("api_override_site", siteParam);
+                json.addProperty("code", 1);
+                json.addProperty("msg", "已设置数据源为【" + name + "】");
+                return createJsonResponse(json);
+            }
+        }
+        
+        // 规则 0: 默认访问（无参数）-> 返回当前 site、raw、style、filters 状态
+        String currentSite = Prefers.getString("api_override_site", getActiveSite().getKey());
+        boolean rawEnabled = "1".equals(Prefers.getString("api_settings_raw", "1"));
+        boolean styleEnabled = "1".equals(Prefers.getString("api_settings_style", "0"));
+        boolean filtersEnabled = "1".equals(Prefers.getString("api_settings_filters", "1"));
+        json.addProperty("site", currentSite);
+        json.addProperty("raw", rawEnabled);
+        json.addProperty("style", styleEnabled);
+        json.addProperty("filters", filtersEnabled);
+        json.addProperty("code", 1);
+        json.addProperty("msg", "数据列表");
+        // 规则 0 返回完整状态，不经过 createJsonResponse（避免字段被移除）
+        try {
+            String jsonStr = gson.toJson(json);
+            byte[] bytes = jsonStr.getBytes("UTF-8");
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json; charset=utf-8", new java.io.ByteArrayInputStream(bytes), bytes.length);
+        } catch (UnsupportedEncodingException e) {
+            return createErrorResponse(500, "编码错误");
+        }
+    }
+
+    // 列表查询处理 (ac=list) - 返回简化的视频列表
+    private NanoHTTPD.Response handleList(Site site, Map<String, String> params) throws Exception {
+        String t = params.get("t");
+        String pg = params.getOrDefault("pg", "1");
+        
+        try {
+            com.fongmi.android.tv.bean.Result result;
+            
+            // 如果指定了分类 t，则返回该分类的列表
+            if (!TextUtils.isEmpty(t)) {
+                result = performCategory(site, t, pg, new java.util.HashMap<>());
+            } else {
+                // 否则返回首页列表
+                result = performHome(site);
+            }
+            
+            JsonObject response = new JsonObject();
+            JsonArray list = new JsonArray();
+            // 添加 class 字段（兼容要求）：使用站点首页的分类信息
+            JsonArray classes = new JsonArray();
+            try {
+                com.fongmi.android.tv.bean.Result home = performHome(site);
+                for (com.fongmi.android.tv.bean.Class clazz : home.getTypes()) {
+                    JsonObject typeJson = new JsonObject();
+                    typeJson.addProperty("type_id", clazz.getTypeId());
+                    typeJson.addProperty("type_name", clazz.getTypeName());
+                    classes.add(typeJson);
+                }
+            } catch (Exception ignored) {}
+            response.add("class", classes);
+            
+            // 转换视频列表，只包含指定字段
+            for (Vod vod : result.getList()) {
+                JsonObject vodJson = new JsonObject();
+                vodJson.addProperty("vod_id", vod.getVodId());
+                vodJson.addProperty("vod_name", vod.getVodName());
+                vodJson.addProperty("type_id", vod.getVodId());
+                vodJson.addProperty("type_name", vod.getTypeName());
+                vodJson.addProperty("vod_time", vod.getVodYear());
+                vodJson.addProperty("vod_remarks", vod.getVodRemarks());
+                vodJson.addProperty("vod_play_from", vod.getVodPlayFrom());
+                list.add(vodJson);
+            }
+            
+            response.add("list", list);
+            
+            // 当 page=0 时，返回的数据应该 page=1
+            int page = Integer.parseInt(pg);
+            if (page == 0) page = 1;
+            
+            // 如果 list 成员数不是 20，limit 需要同步修改为 list.count
+            int limit = list.size() != 20 ? list.size() : 20;
+            int pagecount = result.getPageCount() > 0 ? result.getPageCount() : 9999;
+            int total = pagecount * limit;
+            
+            response.addProperty("page", page);
+            response.addProperty("pagecount", pagecount);
+            response.addProperty("limit", limit);
+            response.addProperty("total", total);
+            
+            return createJsonResponse(response);
+        } catch (Exception e) {
+            return createErrorResponse(500, "列表查询失败：" + (e == null ? "" : e.getMessage()));
+        }
+    }
+
+        // 播放链接处理 (ac=play)
+        private NanoHTTPD.Response handlePlay(Site site, Map<String, String> params) {
+        String flag = params.get("flag");
+        String id = params.get("id");
+        String originalSiteKey = params.get("site");
+        
+            try {
+                Result result;
+                if (site.getType() == 3) {
+                    Spider spider = site.recent().spider();
+                    String playerContent = spider.playerContent(flag, id, VodConfig.get().getFlags());
+                    result = Result.fromJson(playerContent);
+                    if (result.getFlag().isEmpty()) result.setFlag(flag);
+                    result.setUrl(Source.get().fetch(result));
+                    result.setHeader(site.getHeader());
+                    result.setKey(site.getKey());
+                } else if (site.getType() == 4) {
+                    java.util.Map<String, String> p = new java.util.HashMap<>();
+                    p.put("play", id);
+                    p.put("flag", flag);
+                    String playerContent = callSiteApi(site, p);
+                    result = Result.fromJson(playerContent);
+                    if (result.getFlag().isEmpty()) result.setFlag(flag);
+                    result.setUrl(Source.get().fetch(result));
+                    result.setHeader(site.getHeader());
+                    result.setKey(site.getKey());
+                } else if (site.isEmpty() && "push_agent".equals(originalSiteKey)) {
+                    result = new Result();
+                    result.setParse(0);
+                    result.setFlag(flag);
+                    result.setUrl(Url.create().add(id));
+                    result.setUrl(Source.get().fetch(result));
+                } else {
+                    Url url = Url.create().add(id);
+                    result = new Result();
+                    result.setUrl(url);
+                    result.setFlag(flag);
+                    result.setHeader(site.getHeader());
+                    result.setPlayUrl(site.getPlayUrl());
+                    result.setParse(Sniffer.isVideoFormat(url.v()) && result.getPlayUrl().isEmpty() ? 0 : 1);
+                    result.setUrl(Source.get().fetch(result));
+                }
+
+                JsonObject out = new JsonObject();
+                // 默认可播放地址使用 result.url
+                String defaultUrl = result.getUrl() == null ? "" : result.getUrl().v();
+                String playableUrl = defaultUrl;
+                out.addProperty("flag", result.getFlag());
+                out.addProperty("parse", result.getParse());
+                out.addProperty("playUrl", "");
+
+                // 如果请求带有 parse=1 参数，则使用 WebView 嗅探真实播放地址
+                String parseParam = params.get("parse");
+                String proxyParam = params.get("proxy");
+                if ("1".equals(parseParam) && result.getUrl() != null) {
+                    try {
+                        JsonObject sniffed = performWebViewSniffJson(result.getUrl().v());
+                        String real = sniffed.has("url") ? sniffed.get("url").getAsString() : "";
+                        if (!TextUtils.isEmpty(real)) {
+                            // 将真实地址放入 playUrl 字段
+                            out.addProperty("playUrl", real);
+                            // 若请求要求代理，使用嗅探到的真实地址创建代理并把 playableUrl 指向代理路径
+                            if ("1".equals(proxyParam)) {
+                                Map<String, String> proxyHeaders = new HashMap<>();
+                                if (sniffed.has("headers")) {
+                                    try {
+                                        JsonObject hh = sniffed.getAsJsonObject("headers");
+                                        for (Map.Entry<String, com.google.gson.JsonElement> e : hh.entrySet()) proxyHeaders.put(e.getKey(), e.getValue().getAsString());
+                                    } catch (Exception ignored) {}
+                                }
+                                String pid = storeProxyUrl(real, proxyHeaders);
+                                String serverBase = params.getOrDefault("_server", "");
+                                String proxyPath = serverBase.isEmpty() ? ("/vod/proxy?id=" + pid) : (serverBase + "/vod/proxy?id=" + pid);
+                                out.addProperty("proxy", proxyPath);
+                                playableUrl = proxyPath;
+                            } else {
+                                // 不代理时直接使用嗅探到的真实地址作为 playableUrl
+                                playableUrl = real;
+                            }
+                        }
+                        if (sniffed.has("headers")) out.add("headers", sniffed.getAsJsonObject("headers"));
+                    } catch (Exception ignored) {
+                    }
+                }
+                // 若未使用 parse 或嗅探失败，但请求 proxy=1，则为原始 url 提供代理路径
+                if (!"1".equals(parseParam) && "1".equals(proxyParam) && result.getUrl() != null) {
+                    try {
+                        Map<String, String> proxyHeaders = new HashMap<>();
+                        if (result.getHeaders() != null) proxyHeaders.putAll(result.getHeaders());
+                        String pid = storeProxyUrl(result.getUrl().v(), proxyHeaders);
+                        String serverBase = params.getOrDefault("_server", "");
+                        String proxyPath = serverBase.isEmpty() ? ("/vod/proxy?id=" + pid) : (serverBase + "/vod/proxy?id=" + pid);
+                        out.addProperty("proxy", proxyPath);
+                        // 把 playableUrl 指向代理地址
+                        playableUrl = proxyPath;
+                    } catch (Exception ignored) {}
+                }
+                if (result.getHeader() != null) {
+                    JsonObject headerObj = new JsonObject();
+                    for (Map.Entry<String, String> entry : result.getHeaders().entrySet()) {
+                        headerObj.addProperty(entry.getKey(), entry.getValue());
+                    }
+                    out.add("headers", headerObj);
+                }
+
+                // 最终确保 url 字段始终返回可播放地址（嗅探优先 -> 代理优先 -> 原始）
+                out.addProperty("url", playableUrl == null ? "" : playableUrl);
+                //out.add("raw", siteToJson(site));
+                return createJsonResponse(out);
+            } catch (Exception e) {
+                return createErrorResponse(500, "播放失败：" + (e == null ? "" : e.getMessage()));
+            }
+        }
+    
+    // 搜索处理
+    private NanoHTTPD.Response handleSearch(Site site, Map<String, String> params) throws Exception {
+        String wd = params.get("wd");
+        boolean quick = "true".equals(params.get("quick"));
+        
+        try {
+            Result result = performSearch(site, wd, quick);
+            
+            JsonObject response = new JsonObject();
+            JsonArray list = new JsonArray();
+            
+            // 转换搜索结果
+            for (Vod vod : result.getList()) {
+                JsonObject vodJson = vodToJson(vod);
+                list.add(vodJson);
+            }
+            
+            // 获取样式信息
+            JsonObject style = getStyleJson(result, site);
+            
+            response.add("list", list);
+            response.add("style", style);
+            
+            // 修复分页字段逻辑
+            int limit = list.size() != 20 ? list.size() : 20;  // 根据实际 list 大小调整 limit
+            int pagecount = result.getPageCount() > 0 ? result.getPageCount() : 9999;
+            int total = pagecount * limit;  // total = pagecount * limit
+            
+            response.addProperty("page", 1);
+            response.addProperty("pagecount", pagecount);
+            response.addProperty("limit", limit);
+            response.addProperty("total", total);
+            response.add("raw", siteToJson(site));
+            
+            return createJsonResponse(response);
+        } catch (Throwable e) {
+            JsonObject error = new JsonObject();
+            error.addProperty("error", "搜索失败：" + (e == null ? "" : e.getMessage()));
+            error.add("raw", siteToJson(site));
+            return createJsonResponse(error);
+        }
+    }
+    
+    // 详情处理
+    private NanoHTTPD.Response handleDetail(Site site, String ids) throws Exception {
+        try {
+            Result result = performDetail(site, ids);
+            
+            JsonObject response = new JsonObject();
+            JsonArray list = new JsonArray();
+            
+            // 转换详情结果
+            for (Vod vod : result.getList()) {
+                JsonObject vodJson = vodToJson(vod);
+                list.add(vodJson);
+            }
+            
+            // 获取样式信息
+            JsonObject style = getStyleJson(result, site);
+            
+            response.add("list", list);
+            response.add("style", style);
+            response.add("raw", siteToJson(site));
+            
+            return createJsonResponse(response);
+        } catch (Exception e) {
+            String msg;
+            try {
+                String em = e == null ? "" : e.getMessage();
+                if (e instanceof NullPointerException || (em != null && em.contains("JsonObject.get"))) {
+                    String siteName = (site == null || site.getName() == null) ? site.getKey() : site.getName();
+                        msg = siteName + " 站点没有相关分类或资源";
+                } else {
+                    msg = "详情获取失败：" + (e == null ? "未知错误" : e.getMessage());
+                }
+            } catch (Exception ex) {
+                msg = "Detail failed";
+            }
+            JsonObject error = new JsonObject();
+            error.addProperty("error", msg);
+            error.add("raw", siteToJson(site));
+            return createJsonResponse(error);
+        }
+    }
+    
+    // 分类处理
+    private NanoHTTPD.Response handleCategory(Site site, String t, String pg, Map<String, String> params) throws Exception {
+        String f = params.get("f");
+        HashMap<String, String> extend = new HashMap<>();
+        
+        if (!TextUtils.isEmpty(f)) {
+            try {
+                // 解析筛选参数
+                extend = gson.fromJson(f, HashMap.class);
+            } catch (Exception e) {
+                // 忽略JSON解析错误
+            }
+        }
+        
+        try {
+            Result result = performCategory(site, t, pg, extend);
+            
+            JsonObject response = new JsonObject();
+            JsonArray types = new JsonArray();
+            JsonArray list = new JsonArray();
+            JsonObject filters = new JsonObject();
+            
+            // 转换分类列表
+            for (com.fongmi.android.tv.bean.Class clazz : result.getTypes()) {
+                JsonObject typeJson = new JsonObject();
+                typeJson.addProperty("type_id", clazz.getTypeId());
+                typeJson.addProperty("type_name", clazz.getTypeName());
+                types.add(typeJson);
+            }
+            
+            // 转换视频列表
+            for (Vod vod : result.getList()) {
+                JsonObject vodJson = vodToJson(vod);
+                list.add(vodJson);
+            }
+            
+            // 转换筛选器 - 从Result的filters字段和types的filters字段获取
+            // 首先从Result级别的filters获取
+            for (Map.Entry<String, List<com.fongmi.android.tv.bean.Filter>> entry : result.getFilters().entrySet()) {
+                JsonArray filterArray = new JsonArray();
+                for (com.fongmi.android.tv.bean.Filter filter : entry.getValue()) {
+                    JsonObject filterJson = filterToJson(filter);
+                    filterArray.add(filterJson);
+                }
+                filters.add(entry.getKey(), filterArray);
+            }
+            
+            // 然后从每个分类的filters获取
+            for (com.fongmi.android.tv.bean.Class clazz : result.getTypes()) {
+                if (!clazz.getFilters().isEmpty()) {
+                    JsonArray filterArray = new JsonArray();
+                    for (com.fongmi.android.tv.bean.Filter filter : clazz.getFilters()) {
+                        JsonObject filterJson = filterToJson(filter);
+                        filterArray.add(filterJson);
+                    }
+                    // 如果该分类ID还没有筛选器，则添加
+                    if (!filters.has(clazz.getTypeId())) {
+                        filters.add(clazz.getTypeId(), filterArray);
+                    }
+                }
+            }
+            
+            // 获取样式信息
+            JsonObject style = getStyleJson(result, site);
+            
+            response.add("class", types);
+            response.add("list", list);
+            response.add("filters", filters);
+            response.add("style", style);
+            int limit = 20;
+            int pagecount = result.getPageCount() > 0 ? result.getPageCount() : 9999;
+            int total = pagecount * limit;
+            response.addProperty("page", 1);
+            response.addProperty("pagecount", pagecount);
+            response.addProperty("limit", limit);
+            response.addProperty("total", total);
+            response.add("raw", siteToJson(site));
+            
+            return createJsonResponse(response);
+        } catch (Exception e) {
+            JsonObject error = new JsonObject();
+            error.addProperty("error", "分类获取失败：" + (e == null ? "" : e.getMessage()));
+            error.add("raw", siteToJson(site));
+            return createJsonResponse(error);
+        }
+    }
+    
+    // 首页处理
+    private NanoHTTPD.Response handleHome(Site site) throws Exception {
+        try {
+            Result result = performHome(site);
+            
+            JsonObject response = new JsonObject();
+            JsonArray types = new JsonArray();
+            JsonArray list = new JsonArray();
+            JsonObject filters = new JsonObject();
+            
+            // 转换分类列表
+            for (com.fongmi.android.tv.bean.Class clazz : result.getTypes()) {
+                JsonObject typeJson = new JsonObject();
+                typeJson.addProperty("type_id", clazz.getTypeId());
+                typeJson.addProperty("type_name", clazz.getTypeName());
+                types.add(typeJson);
+            }
+            
+            // 转换视频列表
+            for (Vod vod : result.getList()) {
+                JsonObject vodJson = vodToJson(vod);
+                list.add(vodJson);
+            }
+            
+            // 转换筛选器 - 从Result的filters字段和types的filters字段获取
+            // 首先从Result级别的filters获取
+            for (Map.Entry<String, List<com.fongmi.android.tv.bean.Filter>> entry : result.getFilters().entrySet()) {
+                JsonArray filterArray = new JsonArray();
+                for (com.fongmi.android.tv.bean.Filter filter : entry.getValue()) {
+                    JsonObject filterJson = filterToJson(filter);
+                    filterArray.add(filterJson);
+                }
+                filters.add(entry.getKey(), filterArray);
+            }
+            
+            // 然后从每个分类的filters获取
+            for (com.fongmi.android.tv.bean.Class clazz : result.getTypes()) {
+                if (!clazz.getFilters().isEmpty()) {
+                    JsonArray filterArray = new JsonArray();
+                    for (com.fongmi.android.tv.bean.Filter filter : clazz.getFilters()) {
+                        JsonObject filterJson = filterToJson(filter);
+                        filterArray.add(filterJson);
+                    }
+                    // 如果该分类ID还没有筛选器，则添加
+                    if (!filters.has(clazz.getTypeId())) {
+                        filters.add(clazz.getTypeId(), filterArray);
+                    }
+                }
+            }
+            
+            // 获取样式信息
+            JsonObject style = getStyleJson(result, site);
+            
+            response.add("class", types);
+            response.add("list", list);
+            response.add("filters", filters);
+            response.add("style", style);
+            response.add("raw", siteToJson(site));
+            
+            // 修复分页字段逻辑
+            int limit = list.size() != 20 ? list.size() : 20;  // 根据实际 list 大小调整 limit
+            int pagecount = result.getPageCount() > 0 ? result.getPageCount() : 9999;
+            int total = pagecount * limit;  // total = pagecount * limit
+            
+            response.addProperty("page", 1);
+            response.addProperty("pagecount", pagecount);
+            response.addProperty("limit", limit);
+            response.addProperty("total", total);
+            
+            return createJsonResponse(response);
+        } catch (Exception e) {
+            JsonObject error = new JsonObject();
+            error.addProperty("error", "首页获取失败：" + (e == null ? "" : e.getMessage()));
+            error.add("raw", siteToJson(site));
+            return createJsonResponse(error);
+        }
+    }
+    
+    // 配置管理接口
+    private NanoHTTPD.Response handleGetAllSites() {
+        JsonArray sites = new JsonArray();
+        
+        List<Site> allSites = VodConfig.get().getSites();
+        for (Site site : allSites) {
+            sites.add(siteToJson(site));
+        }
+        
+        JsonObject result = new JsonObject();
+        result.add("sites", sites);
+        result.addProperty("total", sites.size());
+        return createJsonResponse(result);
+    }
+    
+    private NanoHTTPD.Response handleGetAllLives() {
+        JsonArray lives = new JsonArray();
+        
+        for (Live live : LiveConfig.get().getLives()) {
+            lives.add(liveToJson(live));
+        }
+        
+        JsonObject result = new JsonObject();
+        result.add("lives", lives);
+        result.addProperty("total", lives.size());
+        return createJsonResponse(result);
+    }
+    
+    private NanoHTTPD.Response handleGetSite(Map<String, String> params) {
+        String key = params.get("key");
+        if (TextUtils.isEmpty(key)) {
+            return createErrorResponse(400, "缺少 key 参数");
+        }
+        
+        Site site = findSiteByKey(key);
+        if (site.isEmpty()) {
+            return createErrorResponse(404, "未找到站点：" + key);
+        }
+        
+        return createJsonResponse(siteToJson(site));
+    }
+    
+    private NanoHTTPD.Response handleGetLive(Map<String, String> params) {
+        String name = params.get("name");
+        if (TextUtils.isEmpty(name)) {
+            return createErrorResponse(400, "缺少 name 参数");
+        }
+        
+        Live live = findLiveByName(name);
+        if (live.isEmpty()) {
+            return createErrorResponse(404, "未找到 Live：" + name);
+        }
+        
+        return createJsonResponse(liveToJson(live));
+    }
+    
+    // 直播流处理
+    private NanoHTTPD.Response handleLiveStream(Map<String, String> params) throws Exception {
+        String name = params.get("name");
+        if (TextUtils.isEmpty(name)) {
+            return createErrorResponse(400, "缺少 name 参数");
+        }
+        
+        Live live = findLiveByName(name);
+        if (live.isEmpty()) {
+            return createErrorResponse(404, "未找到 Live：" + name);
+        }
+        
+        try {
+            // 获取直播流内容
+            String content = live.getUrl(); // 这里可能需要实际去获取URL内容
+            
+            JsonObject result = new JsonObject();
+            result.addProperty("content", content);
+            result.add("raw", liveToJson(live));
+            
+            return createJsonResponse(result);
+        } catch (Exception e) {
+            JsonObject error = new JsonObject();
+            error.addProperty("error", "直播流失败：" + (e == null ? "" : e.getMessage()));
+            error.add("raw", liveToJson(live));
+            return createJsonResponse(error);
+        }
+    }
+    
+    // 视频嗅探处理 - 使用WebView进行智能嗅探
+    private NanoHTTPD.Response handleSniff(Map<String, String> params) throws Exception {
+        String url = params.get("url");
+        if (TextUtils.isEmpty(url)) {
+            return createErrorResponse(400, "缺少 url 参数");
+        }
+        
+        try {
+            url = URLDecoder.decode(url, "UTF-8");
+            
+            // 简单嗅探
+            String simpleResult = Sniffer.getUrl(url);
+            if (Sniffer.isVideoFormat(simpleResult)) {
+                JsonObject result = new JsonObject();
+                result.addProperty("url", simpleResult);
+                result.addProperty("code", 200);
+                result.addProperty("method", "simple");
+                return createJsonResponse(result);
+            }
+            
+            // 复杂网页需要WebView嗅探
+            return performWebViewSniff(url);
+            
+        } catch (Exception e) {
+            return createErrorResponse(500, "嗅探失败：" + (e == null ? "" : e.getMessage()));
+        }
+    }
+    
+    // WebView嗅探的具体实现
+    private NanoHTTPD.Response performWebViewSniff(final String url) {
+        return createJsonResponse(performWebViewSniffJson(url));
+    }
+
+    // WebView嗅探返回 JsonObject 版，便于内部复用
+    private JsonObject performWebViewSniffJson(final String url) {
+        final JsonObject[] webResult = {null};
+        final Object lock = new Object();
+        final Exception[] webError = new Exception[1];
+
+        final com.fongmi.android.tv.impl.ParseCallback callback = new com.fongmi.android.tv.impl.ParseCallback() {
+            @Override
+            public void onParseSuccess(Map<String, String> headers, String videoUrl, String from) {
+                synchronized (lock) {
+                    JsonObject result = new JsonObject();
+                    result.addProperty("url", videoUrl);
+                    result.addProperty("code", 200);
+                    result.addProperty("method", "webview");
+
+                    if (headers != null && !headers.isEmpty()) {
+                        JsonObject headerObj = new JsonObject();
+                        for (Map.Entry<String, String> entry : headers.entrySet()) {
+                            headerObj.addProperty(entry.getKey(), entry.getValue());
+                        }
+                        result.add("headers", headerObj);
+                    }
+
+                    if (!TextUtils.isEmpty(from)) {
+                        result.addProperty("from", from);
+                    }
+
+                    webResult[0] = result;
+                    lock.notify();
+                }
+            }
+
+            @Override
+            public void onParseError() {
+                synchronized (lock) {
+                    JsonObject result = new JsonObject();
+                    result.addProperty("error", "WebView 嗅探失败");
+                    result.addProperty("code", 500);
+                    result.addProperty("method", "webview");
+                    webResult[0] = result;
+                    lock.notify();
+                }
+            }
+        };
+
+        final Map<String, String> headers = new HashMap<>();
+        headers.put("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+
+        for (com.fongmi.android.tv.bean.Site site : VodConfig.get().getSites()) {
+            okhttp3.Headers siteHeaders = site.getHeaders();
+            if (siteHeaders != null && siteHeaders.size() > 0) {
+                for (String name : siteHeaders.names()) {
+                    headers.put(name, siteHeaders.get(name));
+                }
+                break;
+            }
+        }
+
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    com.fongmi.android.tv.ui.custom.CustomWebView webView =
+                        com.fongmi.android.tv.ui.custom.CustomWebView.create(com.fongmi.android.tv.App.get());
+                    webView.start("", "api_sniff", headers, url, "", callback, true);
+
+                    new android.os.Handler().postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                webView.stop(false);
+                                webView.destroy();
+                            } catch (Exception e) {
+                                // 忽略清理错误
+                            }
+                        }
+                    }, 35000);
+
+                } catch (Exception e) {
+                    synchronized (lock) {
+                        webError[0] = e;
+                        lock.notify();
+                    }
+                }
+            }
+        });
+
+        synchronized (lock) {
+            try {
+                lock.wait(30000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        if (webError[0] != null) {
+            JsonObject err = new JsonObject();
+            err.addProperty("error", true);
+            err.addProperty("message", "WebView error: " + webError[0].getMessage());
+            err.addProperty("status", 500);
+            return err;
+        }
+
+        if (webResult[0] != null) return webResult[0];
+
+        JsonObject result = new JsonObject();
+        result.addProperty("url", url);
+        result.addProperty("code", 200);
+        result.addProperty("method", "timeout");
+        result.addProperty("warning", "WebView sniff timeout, using original URL");
+        return result;
+    }
+    
+    // 辅助方法
+    private Live findLiveByName(String name) {
+        for (Live live : LiveConfig.get().getLives()) {
+            if (live.getName().equals(name)) {
+                return live;
+            }
+        }
+        return new Live();
+    }
+    
+    private JsonObject siteToJson(Site site) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("key", site.getKey());
+        obj.addProperty("name", site.getName());
+        obj.addProperty("type", site.getType());
+        obj.addProperty("api", site.getApi());
+        obj.addProperty("ext", site.getExt());
+        obj.addProperty("jar", site.getJar());
+        obj.addProperty("searchable", site.getSearchable());
+        obj.addProperty("quickSearch", site.getQuickSearch());
+        obj.addProperty("filterable", 1); // 默认可筛选
+        return obj;
+    }
+    
+    private JsonObject liveToJson(Live live) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("name", live.getName());
+        obj.addProperty("type", 0); // 默认类型
+        obj.addProperty("url", live.getUrl());
+        obj.addProperty("playerType", 1); // 默认播放器类型
+        obj.addProperty("ua", live.getUa());
+        obj.addProperty("epg", live.getEpg());
+        obj.addProperty("logo", live.getLogo());
+        return obj;
+    }
+    
+    // 创建JSON响应（确保字段顺序：code, msg, page, pagecount, limit, total, 其他字段）
+    private NanoHTTPD.Response createJsonResponse(Object data) {
+        try {
+            // 将 data 转为 JsonObject（若无法转换则放入 data 字段）
+            JsonObject payload = null;
+            if (data instanceof JsonObject) payload = (JsonObject) data;
+            else {
+                try {
+                    String json = gson.toJson(data);
+                    payload = com.github.catvod.utils.Json.parse(json).getAsJsonObject();
+                } catch (Exception e) {
+                    payload = new JsonObject();
+                    payload.add("data", com.github.catvod.utils.Json.parse(gson.toJson(data)));
+                }
+            }
+
+            // 构建有序输出：先 code/msg，再分页字段，最后其他字段
+            JsonObject out = new JsonObject();
+            
+            // 处理错误情况
+            if (payload.has("error")) {
+                String em = payload.get("error").isJsonPrimitive() ? payload.get("error").getAsString() : payload.get("error").toString();
+                out.addProperty("code", 500);
+                out.addProperty("msg", em);
+                // 保留其他字段（如 raw/style）但移除旧的 error 字段
+                for (Map.Entry<String, com.google.gson.JsonElement> e : payload.entrySet()) {
+                    if ("error".equals(e.getKey())) continue;
+                    out.add(e.getKey(), e.getValue());
+                }
+            } else {
+                // 正常返回
+                out.addProperty("code", 1);
+                out.addProperty("msg", "数据列表");
+                
+                // 按优先级添加分页字段（如果存在）
+                if (payload.has("page")) out.add("page", payload.get("page"));
+                if (payload.has("pagecount")) out.add("pagecount", payload.get("pagecount"));
+                if (payload.has("limit")) out.add("limit", payload.get("limit"));
+                if (payload.has("total")) out.add("total", payload.get("total"));
+                
+                // 添加其他字段（除了已处理的分页字段和被过滤的字段）
+                java.util.Set<String> paginationFields = new java.util.HashSet<>(
+                    java.util.Arrays.asList("page", "pagecount", "limit", "total", "code", "msg")
+                );
+                for (Map.Entry<String, com.google.gson.JsonElement> e : payload.entrySet()) {
+                    if (!paginationFields.contains(e.getKey())) {
+                        out.add(e.getKey(), e.getValue());
+                    }
+                }
+            }
+
+            // 根据持久化设置控制是否输出 raw/style/filters 字段（全局统一）
+            String rawPref = Prefers.getString("api_settings_raw", "1");
+            String stylePref = Prefers.getString("api_settings_style", "0");
+            String filtersPref = Prefers.getString("api_settings_filters", "1");
+            if (!"1".equals(rawPref) && out.has("raw")) out.remove("raw");
+            if (!"1".equals(stylePref) && out.has("style")) out.remove("style");
+            if (!"1".equals(filtersPref) && out.has("filters")) out.remove("filters");
+
+            String json = gson.toJson(out);
+            byte[] bytes = json.getBytes("UTF-8");
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json; charset=utf-8", new java.io.ByteArrayInputStream(bytes), bytes.length);
+        } catch (Exception e) {
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "");
+        }
+    }
+
+    // 创建错误响应
+    private NanoHTTPD.Response createErrorResponse(int status, String message) {
+        JsonObject error = new JsonObject();
+        // 成功时 code=1，否则返回状态码作为 code
+        int code = (status >= 200 && status < 300) ? 1 : status;
+        error.addProperty("code", code);
+        error.addProperty("msg", message == null ? "错误" : message);
+
+        NanoHTTPD.Response.Status responseStatus = NanoHTTPD.Response.Status.lookup(status);
+        if (responseStatus == null) responseStatus = NanoHTTPD.Response.Status.INTERNAL_ERROR;
+
+        try {
+            String json = gson.toJson(error);
+            byte[] bytes = json.getBytes("UTF-8");
+            return NanoHTTPD.newFixedLengthResponse(responseStatus, "application/json; charset=utf-8", new java.io.ByteArrayInputStream(bytes), bytes.length);
+        } catch (Exception e) {
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "");
+        }
+    }
+    
+    // 同步执行搜索
+    private com.fongmi.android.tv.bean.Result performSearch(Site site, String keyword, boolean quick) throws Exception {
+        if (site.getType() == 3) {
+            // Spider类型站点
+            if (quick && !site.isQuickSearch()) {
+                return com.fongmi.android.tv.bean.Result.empty();
+            }
+            Spider spider = site.spider();
+            String searchContent = spider.searchContent(keyword, quick);
+            return safeParseResult(searchContent, true);
+        } else {
+            // HTTP类型站点
+            if (quick && !site.isQuickSearch()) {
+                return com.fongmi.android.tv.bean.Result.empty();
+            }
+            java.util.Map<String, String> params = new java.util.HashMap<>();
+            params.put("wd", keyword);
+            params.put("quick", String.valueOf(quick));
+            String searchContent = callSiteApi(site, params);
+            return fetchPic(site, safeParseResult(searchContent, false, site.getType()));
+        }
+    }
+    
+    // 同步执行详情获取
+    private com.fongmi.android.tv.bean.Result performDetail(Site site, String ids) throws Exception {
+        if (site.getType() == 3) {
+            // Spider类型站点
+            Spider spider = site.recent().spider();
+            String detailContent = spider.detailContent(Arrays.asList(ids));
+            com.fongmi.android.tv.bean.Result result = safeParseResult(detailContent, true);
+            if (!result.getList().isEmpty()) result.getList().get(0).setVodFlags();
+            return result;
+        } else {
+            // HTTP类型站点
+            java.util.Map<String, String> params = new java.util.HashMap<>();
+            params.put("ac", site.getType() == 0 ? "videolist" : "detail");
+            params.put("ids", ids);
+            String detailContent = callSiteApi(site, params);
+            com.fongmi.android.tv.bean.Result result = safeParseResult(detailContent, false, site.getType());
+            if (!result.getList().isEmpty()) result.getList().get(0).setVodFlags();
+            return fetchPic(site, result);
+        }
+    }
+    
+    // 安全解析Result，避免null引用错误
+    private com.fongmi.android.tv.bean.Result safeParseResult(String content, boolean isJson) {
+        try {
+            if (TextUtils.isEmpty(content)) {
+                return com.fongmi.android.tv.bean.Result.empty();
+            }
+            
+            if (isJson) {
+                return com.fongmi.android.tv.bean.Result.fromJson(content);
+            } else {
+                return com.fongmi.android.tv.bean.Result.fromXml(content);
+            }
+        } catch (Exception e) {
+            // JSON/XML解析失败时返回空结果
+            android.util.Log.e("Api", "解析结果失败：" + e.getMessage());
+            return com.fongmi.android.tv.bean.Result.empty();
+        }
+    }
+    
+    // 安全解析Result（带类型）
+    private com.fongmi.android.tv.bean.Result safeParseResult(String content, boolean isJson, int type) {
+        try {
+            if (TextUtils.isEmpty(content)) {
+                return com.fongmi.android.tv.bean.Result.empty();
+            }
+            
+            return com.fongmi.android.tv.bean.Result.fromType(type, content);
+        } catch (Exception e) {
+            // 解析失败时返回空结果
+            android.util.Log.e("Api", "解析结果失败：" + e.getMessage());
+            return com.fongmi.android.tv.bean.Result.empty();
+        }
+    }
+    
+    // 同步执行分类获取
+    private com.fongmi.android.tv.bean.Result performCategory(Site site, String tid, String page, HashMap<String, String> extend) throws Exception {
+        if (site.getType() == 3) {
+            // Spider类型站点
+            Spider spider = site.recent().spider();
+            String categoryContent = spider.categoryContent(tid, page, true, extend);
+            return safeParseResult(categoryContent, true);
+        } else {
+            // HTTP类型站点
+            java.util.Map<String, String> params = new java.util.HashMap<>();
+            if (site.getType() == 1 && !extend.isEmpty()) {
+                params.put("f", gson.toJson(extend));
+            }
+            params.put("ac", site.getType() == 0 ? "videolist" : "detail");
+            params.put("t", tid);
+            params.put("pg", page);
+            String categoryContent = callSiteApi(site, params);
+            return safeParseResult(categoryContent, false, site.getType());
+        }
+    }
+    
+    // 同步执行首页获取
+    private com.fongmi.android.tv.bean.Result performHome(Site site) throws Exception {
+        if (site.getType() == 3) {
+            // Spider类型站点
+            Spider spider = site.recent().spider();
+            
+            // 获取首页内容（包含分类）
+            String homeContent = spider.homeContent(true);
+            com.fongmi.android.tv.bean.Result result = safeParseResult(homeContent, true);
+            
+            // 如果首页没有视频列表，尝试多种方法获取
+            if (result.getList().isEmpty()) {
+                // 方法1：尝试获取首页视频内容
+                try {
+                    String homeVideoContent = spider.homeVideoContent();
+                    if (!TextUtils.isEmpty(homeVideoContent)) {
+                        com.fongmi.android.tv.bean.Result videoResult = safeParseResult(homeVideoContent, true);
+                        if (!videoResult.getList().isEmpty()) {
+                            result.setList(videoResult.getList());
+                        }
+                    }
+                } catch (Exception e) {
+                    // 忽略homeVideoContent错误，继续尝试其他方法
+                }
+                
+                // 方法2：如果还是没有数据，获取第一个分类的内容
+                if (result.getList().isEmpty() && !result.getTypes().isEmpty()) {
+                    try {
+                        String firstTypeId = result.getTypes().get(0).getTypeId();
+                        String categoryContent = spider.categoryContent(firstTypeId, "1", true, new java.util.HashMap<>());
+                        if (!TextUtils.isEmpty(categoryContent)) {
+                            com.fongmi.android.tv.bean.Result categoryResult = safeParseResult(categoryContent, true);
+                            if (!categoryResult.getList().isEmpty()) {
+                                result.setList(categoryResult.getList());
+                                // 保留第一个分类的筛选器
+                                if (!categoryResult.getFilters().isEmpty()) {
+                                    result.getFilters().putAll(categoryResult.getFilters());
+                                }
+                                // 也保留分类本身的筛选器
+                                for (com.fongmi.android.tv.bean.Class categoryClass : categoryResult.getTypes()) {
+                                    if (!categoryClass.getFilters().isEmpty()) {
+                                        // 找到对应的分类并更新其筛选器
+                                        for (com.fongmi.android.tv.bean.Class homeClass : result.getTypes()) {
+                                            if (homeClass.getTypeId().equals(categoryClass.getTypeId())) {
+                                                homeClass.setFilters(categoryClass.getFilters());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception ex) {
+                        // 如果第一个分类也失败，尝试其他分类
+                        for (int i = 1; i < Math.min(result.getTypes().size(), 3); i++) {
+                            try {
+                                String typeId = result.getTypes().get(i).getTypeId();
+                                String categoryContent = spider.categoryContent(typeId, "1", true, new java.util.HashMap<>());
+                                if (!TextUtils.isEmpty(categoryContent)) {
+                                    com.fongmi.android.tv.bean.Result categoryResult = safeParseResult(categoryContent, true);
+                                    if (!categoryResult.getList().isEmpty()) {
+                                        result.setList(categoryResult.getList());
+                                        if (!categoryResult.getFilters().isEmpty()) {
+                                            result.getFilters().putAll(categoryResult.getFilters());
+                                        }
+                                        // 也保留分类本身的筛选器
+                                        for (com.fongmi.android.tv.bean.Class categoryClass : categoryResult.getTypes()) {
+                                            if (!categoryClass.getFilters().isEmpty()) {
+                                                // 找到对应的分类并更新其筛选器
+                                                for (com.fongmi.android.tv.bean.Class homeClass : result.getTypes()) {
+                                                    if (homeClass.getTypeId().equals(categoryClass.getTypeId())) {
+                                                        homeClass.setFilters(categoryClass.getFilters());
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            } catch (Exception ex2) {
+                                // 继续尝试下一个分类
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 如果还是没有筛选器信息，主动获取几个分类的筛选器
+            if (result.getFilters().isEmpty() && !result.getTypes().isEmpty()) {
+                try {
+                    for (int i = 0; i < Math.min(result.getTypes().size(), 5); i++) {
+                        try {
+                            String typeId = result.getTypes().get(i).getTypeId();
+                            String categoryContent = spider.categoryContent(typeId, "1", true, new java.util.HashMap<>());
+                            if (!TextUtils.isEmpty(categoryContent)) {
+                                com.fongmi.android.tv.bean.Result categoryResult = safeParseResult(categoryContent, true);
+                                
+                                // 获取该分类的筛选器
+                                if (!categoryResult.getFilters().isEmpty()) {
+                                    result.getFilters().putAll(categoryResult.getFilters());
+                                }
+                                
+                                // 更新分类本身的筛选器
+                                for (com.fongmi.android.tv.bean.Class categoryClass : categoryResult.getTypes()) {
+                                    if (!categoryClass.getFilters().isEmpty()) {
+                                        for (com.fongmi.android.tv.bean.Class homeClass : result.getTypes()) {
+                                            if (homeClass.getTypeId().equals(categoryClass.getTypeId())) {
+                                                homeClass.setFilters(categoryClass.getFilters());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Exception ex) {
+                            // 忽略单个分类的错误，继续处理其他分类
+                        }
+                    }
+                } catch (Exception e) {
+                    // 忽略筛选器获取错误
+                }
+            }
+            
+            return result;
+        } else {
+            // HTTP类型站点
+            java.util.Map<String, String> params = new java.util.HashMap<>();
+            try {
+                String homeContent = callSiteApi(site, params);
+                if (TextUtils.isEmpty(homeContent)) {
+                    return com.fongmi.android.tv.bean.Result.empty();
+                }
+                return fetchPic(site, safeParseResult(homeContent, false, site.getType()));
+            } catch (Exception e) {
+                // HTTP站点错误时返回空结果
+                return com.fongmi.android.tv.bean.Result.empty();
+            }
+        }
+    }
+    
+    // 调用站点API
+    private String callSiteApi(Site site, java.util.Map<String, String> params) throws Exception {
+        if (!site.getExt().isEmpty()) params.put("extend", site.getExt());
+        
+        // 构建请求
+        StringBuilder urlBuilder = new StringBuilder(site.getApi());
+        if (!params.isEmpty()) {
+            urlBuilder.append("?");
+            boolean first = true;
+            for (java.util.Map.Entry<String, String> entry : params.entrySet()) {
+                if (!first) urlBuilder.append("&");
+                urlBuilder.append(entry.getKey()).append("=").append(java.net.URLEncoder.encode(entry.getValue(), "UTF-8"));
+                first = false;
+            }
+        }
+        
+        // 发起请求
+        java.net.URL url = new java.net.URL(urlBuilder.toString());
+        java.net.HttpURLConnection connection = (java.net.HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(10000);
+        connection.setReadTimeout(10000);
+        
+        // 读取响应
+        java.io.BufferedReader reader = new java.io.BufferedReader(
+            new java.io.InputStreamReader(connection.getInputStream(), "UTF-8"));
+        StringBuilder response = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            response.append(line);
+        }
+        reader.close();
+        connection.disconnect();
+        
+        return response.toString();
+    }
+    
+    // 获取图片信息（HTTP站点需要）
+    private com.fongmi.android.tv.bean.Result fetchPic(Site site, com.fongmi.android.tv.bean.Result result) throws Exception {
+        if (site.getType() > 2 || result.getList().isEmpty() || !result.getList().get(0).getVodPic().isEmpty()) {
+            return result;
+        }
+        
+        java.util.ArrayList<String> ids = new java.util.ArrayList<>();
+        if (site.getCategories().isEmpty()) {
+            for (Vod item : result.getList()) ids.add(item.getVodId());
+        } else {
+            for (Vod item : result.getList()) {
+                if (site.getCategories().contains(item.getTypeName())) {
+                    ids.add(item.getVodId());
+                }
+            }
+        }
+        
+        if (ids.isEmpty()) return result.clear();
+        
+        java.util.Map<String, String> params = new java.util.HashMap<>();
+        params.put("ac", site.getType() == 0 ? "videolist" : "detail");
+        params.put("ids", TextUtils.join(",", ids));
+        String response = callSiteApi(site, params);
+        com.fongmi.android.tv.bean.Result picResult = safeParseResult(response, false, site.getType());
+        result.setList(picResult.getList());
+        return result;
+    }
+    
+    // 获取样式信息JSON
+    private JsonObject getStyleJson(com.fongmi.android.tv.bean.Result result, Site site) {
+        JsonObject styleJson = new JsonObject();
+        
+        try {
+            // 获取样式，优先级：结果样式 > 站点样式 > 默认样式
+            com.fongmi.android.tv.bean.Style style = result.getStyle(site.getStyle());
+            
+            if (style != null) {
+                styleJson.addProperty("type", style.getType());
+                styleJson.addProperty("ratio", style.getRatio());
+                styleJson.addProperty("viewType", style.getViewType());
+                styleJson.addProperty("isRect", style.isRect());
+                styleJson.addProperty("isOval", style.isOval());
+                styleJson.addProperty("isList", style.isList());
+                styleJson.addProperty("isLand", style.isLand());
+            } else {
+                // 默认样式
+                styleJson.addProperty("type", "rect");
+                styleJson.addProperty("ratio", 0.75f);
+                styleJson.addProperty("viewType", 0);
+                styleJson.addProperty("isRect", true);
+                styleJson.addProperty("isOval", false);
+                styleJson.addProperty("isList", false);
+                styleJson.addProperty("isLand", false);
+            }
+        } catch (Exception e) {
+            // 如果获取样式失败，使用默认样式
+            styleJson.addProperty("type", "rect");
+            styleJson.addProperty("ratio", 0.75f);
+            styleJson.addProperty("viewType", 0);
+            styleJson.addProperty("isRect", true);
+            styleJson.addProperty("isOval", false);
+            styleJson.addProperty("isList", false);
+            styleJson.addProperty("isLand", false);
+        }
+        
+        return styleJson;
+    }
+    
+    // 转换Vod对象为JSON
+    private JsonObject vodToJson(Vod vod) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("vod_id", vod.getVodId());
+        obj.addProperty("vod_name", vod.getVodName());
+        obj.addProperty("vod_pic", vod.getVodPic());
+        obj.addProperty("vod_remarks", vod.getVodRemarks());
+        obj.addProperty("vod_year", vod.getVodYear());
+        obj.addProperty("vod_area", vod.getVodArea());
+        obj.addProperty("vod_director", vod.getVodDirector());
+        obj.addProperty("vod_actor", vod.getVodActor());
+        obj.addProperty("vod_content", vod.getVodContent());
+        obj.addProperty("vod_play_from", vod.getVodPlayFrom());
+        obj.addProperty("vod_play_url", vod.getVodPlayUrl());
+        obj.addProperty("vod_tag", vod.getVodTag());
+        obj.addProperty("type_id", vod.getVodId());
+        obj.addProperty("type_name", vod.getTypeName());
+        return obj;
+    }
+    
+    // 转换Filter对象为JSON
+    private JsonObject filterToJson(com.fongmi.android.tv.bean.Filter filter) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("key", filter.getKey());
+        obj.addProperty("name", filter.getName());
+        obj.addProperty("init", filter.getInit());
+        
+        JsonArray values = new JsonArray();
+        for (com.fongmi.android.tv.bean.Value value : filter.getValue()) {
+            JsonObject valueObj = new JsonObject();
+            valueObj.addProperty("n", value.getN());
+            valueObj.addProperty("v", value.getV());
+            values.add(valueObj);
+        }
+        obj.add("value", values);
+        
+        return obj;
+    }
+}

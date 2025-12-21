@@ -12,7 +12,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.os.HandlerCompat;
 
-import com.fongmi.android.tv.event.EventIndex;
+// import com.fongmi.android.tv.event.EventIndex;
 import com.fongmi.android.tv.ui.activity.CrashActivity;
 import com.fongmi.android.tv.utils.Notify;
 import com.fongmi.hook.Hook;
@@ -116,7 +116,9 @@ public class App extends Application {
         Notify.createChannel();
         Logger.addLogAdapter(getLogAdapter());
         OkHttp.get().setDoh(Doh.objectFrom(Setting.getDoh()));
-        EventBus.builder().addIndex(new EventIndex()).installDefaultEventBus();
+        // 暂时注释 EventIndex，首次编译成功后注解处理器会生成该类
+        // EventBus.builder().addIndex(new EventIndex()).installDefaultEventBus();
+        EventBus.builder().installDefaultEventBus();
         CaocConfig.Builder.create().trackActivities(true).backgroundMode(CaocConfig.BACKGROUND_MODE_SILENT).errorActivity(CrashActivity.class).apply();
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {
             @Override

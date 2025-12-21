@@ -1,4 +1,5 @@
 lxml
+flask
 ujson
 pyquery
 requests

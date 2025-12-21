@@ -12,8 +12,8 @@ android {
         minSdk 24
         //noinspection ExpiredTargetSdkVersion
         targetSdk 28
-        versionCode 459
-        versionName "4.5.9"
+        versionCode 471
+        versionName "4.7.1"
         javaCompileOptions {
             annotationProcessorOptions {
                 arguments = ["room.schemaLocation": "$projectDir/schemas".toString(), "eventBusIndex": "com.fongmi.android.tv.event.EventIndex"]
@@ -45,11 +45,22 @@ android {
         viewBinding true
     }
 
+    signingConfigs {
+        release {
+            storeFile file("../release.keystore")
+            storePassword System.getenv("KEYSTORE_PASSWORD") ?: "123456"
+            keyAlias System.getenv("KEY_ALIAS") ?: "release"
+            keyPassword System.getenv("KEY_PASSWORD") ?: "123456"
+        }
+    }
+
+
     buildTypes {
         release {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+			signingConfig signingConfigs.release
         }
     }
 

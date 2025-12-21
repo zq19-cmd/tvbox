@@ -63,7 +63,7 @@ public class FolderFragment extends BaseFragment {
         return (VodFragment) getParentFragment();
     }
 
-    private TypeFragment getChild() {
+    public TypeFragment getChild() {
         return (TypeFragment) getChildFragmentManager().findFragmentById(R.id.container);
     }
 

@@ -20,6 +20,11 @@ import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.extractor.DefaultExtractorsFactory;
 import androidx.media3.extractor.ExtractorsFactory;
 import androidx.media3.extractor.ts.TsExtractor;
+// avoid direct DashMediaSource/DataSourceFactory imports to prevent compile errors when dash module is optional
+import androidx.media3.common.util.UriUtil;
+
+import android.util.Base64;
+import android.net.Uri;
 
 import com.fongmi.android.tv.App;
 import com.github.catvod.net.OkHttp;
@@ -59,10 +64,36 @@ public class MediaSourceFactory implements MediaSource.Factory {
     @NonNull
     @Override
     public MediaSource createMediaSource(@NonNull MediaItem mediaItem) {
-        if (mediaItem.mediaId.contains("***") && mediaItem.mediaId.contains("|||")) {
-            return createConcatenatingMediaSource(setHeader(mediaItem));
+        MediaItem mi = setHeader(mediaItem);
+
+        // support data:application/dash+xml;base64,.... minimal handling
+        try {
+            Uri uri = mi.playbackProperties == null ? Uri.parse(mi.mediaId) : mi.playbackProperties.uri;
+            String s = uri.toString();
+            String prefix = "data:application/dash+xml;base64,";
+            if (s.startsWith(prefix)) {
+                String b64 = s.substring(prefix.length());
+                byte[] mpdBytes = Base64.decode(b64, Base64.DEFAULT);
+                try {
+                    // write MPD to a temporary file in cache and let the existing DefaultMediaSourceFactory handle it
+                    java.io.File cacheDir = App.get().getCacheDir();
+                    java.io.File mpdFile = new java.io.File(cacheDir, "data_mpd_" + System.currentTimeMillis() + ".mpd");
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(mpdFile);
+                    fos.write(mpdBytes);
+                    fos.flush();
+                    fos.close();
+                    Uri fileUri = Uri.fromFile(mpdFile);
+                    return defaultMediaSourceFactory.createMediaSource(mi.buildUpon().setUri(fileUri).build());
+                } catch (Exception e) {
+                    // fallback to default behavior
+                }
+            }
+        } catch (Exception ignored) {}
+
+        if (mi.mediaId.contains("***") && mi.mediaId.contains("|||")) {
+            return createConcatenatingMediaSource(mi);
         } else {
-            return defaultMediaSourceFactory.createMediaSource(setHeader(mediaItem));
+            return defaultMediaSourceFactory.createMediaSource(mi);
         }
     }
 

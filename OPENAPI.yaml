@@ -1,0 +1,657 @@
+openapi: 3.0.3
+info:
+  title: API
+  version: 1.0.0
+  description: TV-release 内置 HTTP API 文档。基于 NanoHTTPD，支持采集站兼容、播放代理、智能嗅探等功能。所有响应统一结构：code, msg, page, pagecount, limit, total（若适用），其他业务字段。
+
+servers:
+  - url: http://{host}:{port}
+    variables:
+      host:
+        default: 192.168.2.111
+      port:
+        default: "9978"
+
+tags:
+  - name: VOD
+    description: 视频相关接口（列表、详情、播放、搜索）
+  - name: Sniff
+    description: 智能嗅探接口（WebView、关键字过滤、自定义请求头、JS 执行）
+  - name: Proxy
+    description: 代理相关（媒体流代理、播放地址代理）
+  - name: Config
+    description: 配置管理（设置查询、修改、站点管理）
+  - name: SiteMenu
+    description: 站源切换功能（伪分类模式）
+  - name: Live
+    description: 直播接口
+  - name: Compat
+    description: 兼容性接口（采集站）
+
+paths:
+  /vod/api:
+    get:
+      tags:
+        - VOD
+      summary: /vod/api
+      description: 统一 VOD API 入口。根据参数 ac 分派不同动作（list 列表、play 播放地址、ids 详情、wd 搜索）
+      parameters:
+        - name: ac
+          in: query
+          schema:
+            type: string
+            enum:
+              - list
+              - play
+          description: 动作类型。list-分类/列表查询；play-播放地址获取
+        - name: site
+          in: query
+          schema:
+            type: string
+          description: 站点 key（可选，若不提供使用活动站点）。示例：bilibili, SP360
+        - name: ids
+          in: query
+          schema:
+            type: string
+          description: 视频 ID（逗号分隔多个）。示例：123,456
+        - name: t
+          in: query
+          schema:
+            type: string
+          description: 分类 ID。示例：1
+        - name: tid
+          in: query
+          schema:
+            type: string
+          description: 分类 ID（同 t）
+        - name: pg
+          in: query
+          schema:
+            type: integer
+          description: 页码（默认 1）。若为 0 自动转 1
+        - name: page
+          in: query
+          schema:
+            type: integer
+          description: 页码（同 pg）
+        - name: wd
+          in: query
+          schema:
+            type: string
+          description: 搜索关键字（URL 编码）
+        - name: flag
+          in: query
+          schema:
+            type: string
+          description: 播放线路标识。示例：线路1, 默认线路
+        - name: id
+          in: query
+          schema:
+            type: string
+          description: 播放 id 或原始地址（base64、HTTP URL 等）
+        - name: parse
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 嗅探模式。1-通过 WebView 嗅探真实播放地址；0-直接返回
+        - name: proxy
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 代理模式。1-返回代理路径；0-返回原始地址。若全局 playProxy=1，自动注入为 1
+        - name: f
+          in: query
+          schema:
+            type: string
+          description: 筛选参数（JSON 格式）。示例：{"type":"电影","year":"2025"}
+        - name: ext
+          in: query
+          schema:
+            type: string
+          description: 扩展参数（与 f 等价）。可为 base64 编码的 JSON，会自动解码
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              example:
+                code: 1
+                msg: 数据列表
+                page: 1
+                pagecount: 50
+                limit: 20
+                total: 1000
+                list:
+                  - vod_id: "mv_226489"
+                    vod_name: "示例影片"
+                    type_id: "1"
+                    type_name: "电影"
+                    vod_time: "2025"
+                    vod_remarks: "HD"
+                    vod_play_from: "线路1"
+                  - vod_id: "mv_226490"
+                    vod_name: "另一部影片"
+                    type_id: "2"
+                    type_name: "电视剧"
+                    vod_time: "2024"
+                    vod_remarks: "1080P"
+                    vod_play_from: "线路2"
+                class:
+                  - type_id: "site_menu"
+                    type_name: "站源切换"
+                  - type_id: "1"
+                    type_name: "电影"
+                  - type_id: "2"
+                    type_name: "电视剧"
+    post:
+      tags:
+        - VOD
+      summary: /vod/api (POST)
+      description: 同 GET，接受 application/x-www-form-urlencoded
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            example:
+              ac: list
+              site: bilibili
+              t: "1"
+              pg: "1"
+      responses:
+        "200":
+          description: 同 GET
+
+  /vod/sniff:
+    get:
+      tags:
+        - Sniff
+      summary: /vod/sniff
+      description: 使用 WebView 智能嗅探页面以获取视频直链。流程：快速嗅探 → WebView 加载（注入自定义请求头、执行 JS） → 关键字过滤（或内置规则） → 代理转换
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 要嗅探的页面 URL（URL 编码）。示例：https%3A%2F%2Fhaokan.baidu.com%2Fv%3Fvid%3D10651857743674669637
+        - name: quick
+          in: query
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+          description: 是否仅做快速嗅探（不使用 WebView）
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              example:
+                code: 200
+                method: webview
+                url: "http://192.168.2.111:9978/vod/proxy?id=8480cf86b0562231"
+                realurl: "https://origin.com/stream.m3u8?token=xxxxx"
+                headers:
+                  User-Agent: "Mozilla/5.0"
+    post:
+      tags:
+        - Sniff
+      summary: /vod/sniff (POST)
+      description: 同 GET，接受 application/x-www-form-urlencoded
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            example:
+              url: "https://example.com/page"
+      responses:
+        "200":
+          description: 同 GET
+
+  /vod/proxy:
+    get:
+      tags:
+        - Proxy
+      summary: /vod/proxy
+      description: 对上游媒体资源做流式转发。若内容为 m3u8，读取文本并把每行片段地址替换为本地代理路径；非 m3u8 则直接流式转发
+      parameters:
+        - name: id
+          in: query
+          schema:
+            type: string
+          description: 内部代理 ID（由 storeProxyUrl 生成）。示例：abcd1234, 8480cf86b0562231
+        - name: url
+          in: query
+          schema:
+            type: string
+          description: 直接代理上游 URL（无需预先存储 ID）。示例：https://example.com/video.mp4
+      responses:
+        "200":
+          description: 媒体流或 m3u8 文本（Content-Type 动态）
+
+  /vod/play/{id}.tvp.m3u8:
+    get:
+      tags:
+        - Proxy
+      summary: /vod/play/{id}.tvp.{ext}（智能后缀播放代理）
+      description: |
+        PlayProxy 播放代理入口（新格式，使用 .tvp.{ext} 动态后缀）。
+        - 用于重写的详情页中的 vod_play_url 指向此路径
+        - ID 格式：16位（10位时间戳 + 6位短哈希），比旧格式更短
+        - .tvp 作为独特标识符，便于识别自己的代理URL
+        - .{ext} 保留原始文件扩展名（如 .m3u8, .ts, .mp4, .flv 等），保证播放器兼容性
+        - **智能后缀检测**：即使原URL不是标准格式（如 file.mp4/ts/xxx?token=xxx），也能正确识别扩展名
+        - 查找内存映射 → 调用播放逻辑 → 若启用 playProxy=1 返回代理路径（并重写 m3u8 片段地址），否则 302 重定向
+        - 如果上游是 m3u8 文件，会自动重写其中的片段地址为代理地址
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{16}$"
+          description: 生成的播放代理 ID（16位十六进制：10位时间戳+6位哈希）。示例：173a5e2f8c1a2b
+      responses:
+        "200":
+          description: 返回重写后的 m3u8 或代理流
+          content:
+            application/vnd.apple.mpegurl:
+              example: |
+                #EXTM3U
+                #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=800000,RESOLUTION=1920x1080
+                /vod/play/173a5e2f8d3c4e.tvp.m3u8
+                
+                # TS片段示例
+                #EXTINF:10.0,
+                /vod/play/173a5e2f9a1b2c.tvp.ts
+                #EXTINF:10.0,
+                /vod/play/173a5e2fa2c3d4.tvp.ts
+        "302":
+          description: 重定向到最终播放地址（playProxy=0 时）
+        "404":
+          description: ID 不存在或已过期
+
+  /vod/play/{id}.m3u8:
+    get:
+      tags:
+        - Proxy
+      summary: /vod/play/{id}.m3u8（兼容旧格式）
+      description: |
+        PlayProxy 播放代理入口（兼容旧格式）。
+        - 功能与 .tvp.m3u8 格式相同，但为了兼容旧版本保留
+        - 建议使用新格式 .tvp.m3u8
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: 播放代理 ID
+      responses:
+        "302":
+          description: 重定向到最终播放地址
+        "404":
+          description: ID 不存在或已过期
+
+  /config/settings:
+    get:
+      tags:
+        - Config
+      summary: /config/settings (查询)
+      description: 查询所有配置项状态
+      responses:
+        "200":
+          description: 配置状态
+          content:
+            application/json:
+              example:
+                site: bilibili
+                raw: false
+                style: false
+                filters: true
+                playProxy: true
+                rewritePlayUrl: false
+                siteMenu: false
+                sniffKeywords: "http*.m3u8*|.mp4"
+                sniffHeaders: '{"cookie":"xxxx","User-Agent":"Mozilla"}'
+                sniffJs: "document.querySelector('#play').click"
+                code: 1
+                msg: 数据列表
+    post:
+      tags:
+        - Config
+      summary: /config/settings (修改)
+      description: 修改配置。支持 GET/POST
+      parameters:
+        - name: site
+          in: query
+          schema:
+            type: string
+          description: 设置或清空数据源。site=KEY 临时覆盖；site= 清空覆盖恢复默认
+        - name: raw
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 是否输出 raw 字段
+        - name: style
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 是否输出 style 字段
+        - name: filters
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 是否输出 filters 字段
+        - name: playProxy
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 全局播放流量转发。1-启用；0-禁用
+        - name: playproxy
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: playProxy 的小写别名（会同步到 playProxy）
+        - name: rewritePlayUrl
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 详情播放地址重写。1-启用；0-禁用
+        - name: siteMenu
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+          description: 站源切换分类显示。1-启用（在分类列表开头显示"站源切换"）；0-禁用（默认）
+        - name: sniffKeywords
+          in: query
+          schema:
+            type: string
+          description: 嗅探关键字（支持通配符 *）。格式：http*.m3u8*|.mp4|*.flv
+        - name: sniffHeaders
+          in: query
+          schema:
+            type: string
+          description: 自定义请求头（JSON 格式）。示例：{"cookie":"session=xxx","User-Agent":"Custom/1.0"}
+        - name: sniffJs
+          in: query
+          schema:
+            type: string
+          description: 执行的 JavaScript 代码。示例：document.querySelector("button").click;
+      responses:
+        "200":
+          description: 修改结果
+          content:
+            application/json:
+              example:
+                code: 1
+                msg: "已设置数据源为【SP360】"
+
+  /config/sites:
+    get:
+      tags:
+        - Config
+      summary: /config/sites
+      description: 列出所有内置站点
+      responses:
+        "200":
+          description: 站点列表
+          content:
+            application/json:
+              example:
+                sites:
+                  - key: bilibili
+                    name: B 站
+                    type: 3
+                    searchable: 1
+                    quickSearch: 1
+                  - key: SP360
+                    name: 360
+                    type: 1
+                    api: https://api.example.com
+                total: 2
+
+  /config/site:
+    get:
+      tags:
+        - Config
+      summary: /config/site
+      description: 获取单个站点信息
+      parameters:
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 站点 key。示例：bilibili
+      responses:
+        "200":
+          description: 站点信息
+          content:
+            application/json:
+              example:
+                key: bilibili
+                name: B 站
+                type: 3
+                searchable: 1
+                quickSearch: 1
+
+  /config/lives:
+    get:
+      tags:
+        - Live
+      summary: /config/lives
+      description: 列出所有直播源
+      responses:
+        "200":
+          description: 直播列表
+          content:
+            application/json:
+              example:
+                lives:
+                  - name: CCTV
+                    url: http://example.com/live.m3u8
+                total: 1
+
+  /config/live:
+    get:
+      tags:
+        - Live
+      summary: /config/live
+      description: 获取单个直播源信息
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 直播名称。示例：CCTV
+      responses:
+        "200":
+          description: 直播信息
+          content:
+            application/json:
+              example:
+                name: CCTV
+                url: http://example.com/live.m3u8
+
+  /live:
+    get:
+      tags:
+        - Live
+      summary: /live
+      description: 获取直播流信息
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 直播名称
+      responses:
+        "200":
+          description: 直播流内容
+
+  /index.php/ajax/data.html:
+    get:
+      tags:
+        - Compat
+      summary: /index.php/ajax/data.html
+      description: 兼容采集站伪接口。会自动把参数转换为标准 /vod/api 格式（tid → t, page → pg, 注入 ac=list）
+      parameters:
+        - name: tid
+          in: query
+          schema:
+            type: string
+          description: 分类 ID。示例：1
+        - name: page
+          in: query
+          schema:
+            type: integer
+          description: 页码
+        - name: mid
+          in: query
+          schema:
+            type: string
+          description: 忽略（保留兼容性）
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          description: 忽略（由系统自动调整）
+      responses:
+        "200":
+          description: 列表响应（同 /vod/api?ac=list）
+          content:
+            application/json:
+              example:
+                code: 1
+                msg: 数据列表
+                page: 1
+                pagecount: 50
+                limit: 20
+                total: 1000
+                list:
+                  - vod_id: "1"
+                    vod_name: "视频1"
+                    type_id: "1"
+                    type_name: "电影"
+                    vod_time: "2025"
+                    vod_remarks: "HD"
+                    vod_play_from: "线路1"
+                class:
+                  - type_id: "1"
+                    type_name: "电影"
+
+  /vod/api?t=site_menu:
+    get:
+      tags:
+        - SiteMenu
+      summary: /vod/api?t=site_menu（站源切换列表）
+      description: 获取所有可用站源列表（伪装成视频列表）。需先启用 siteMenu=1，否则此分类不会出现在 class 列表中
+      parameters:
+        - name: t
+          in: query
+          required: true
+          schema:
+            type: string
+            enum:
+              - site_menu
+          description: 固定值 site_menu
+        - name: pg
+          in: query
+          schema:
+            type: integer
+            default: 1
+          description: 页码（站源列表一般只有一页）
+      responses:
+        "200":
+          description: 站源列表（伪装成视频列表格式）
+          content:
+            application/json:
+              example:
+                code: 1
+                msg: 数据列表
+                page: 1
+                pagecount: 1
+                limit: 5
+                total: 5
+                list:
+                  - vod_id: "site_bilibili"
+                    vod_name: "B站"
+                    vod_pic: "https://dummyimage.com/450x600/f4e4c1/333333.png&text=1"
+                    vod_remarks: "bilibili"
+                    type_name: "站源切换"
+                  - vod_id: "site_SP360"
+                    vod_name: "360影视"
+                    vod_pic: "https://dummyimage.com/450x600/f4e4c1/333333.png&text=2"
+                    vod_remarks: "SP360"
+                    type_name: "站源切换"
+                  - vod_id: "site_alist"
+                    vod_name: "Alist"
+                    vod_pic: "https://dummyimage.com/450x600/f4e4c1/333333.png&text=3"
+                    vod_remarks: "alist"
+                    type_name: "站源切换"
+
+  /vod/api?ids=site_{key}:
+    get:
+      tags:
+        - SiteMenu
+      summary: /vod/api?ids=site_{key}（执行站源切换）
+      description: 通过详情接口执行站源切换。点击站源列表中的某个站源时调用此接口。会自动设置 api_override_site 并清空结果缓存
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: "^site_.*"
+          description: 站源 ID，格式为 site_{站源key}。示例：site_bilibili, site_SP360
+      responses:
+        "200":
+          description: 切换成功响应（伪装成视频详情格式）
+          content:
+            application/json:
+              example:
+                code: 1
+                msg: 数据列表
+                list:
+                  - vod_id: "site_bilibili"
+                    vod_name: "切换成功"
+                    vod_pic: "https://dummyimage.com/450x600/f4e4c1/333333.png&text=0"
+                    vod_content: "已切换到站源：B站"
+                    vod_play_from: "提示"
+                    vod_play_url: "提示$https://vod.example.com/demo.mp4"
+        "500":
+          description: 切换失败
+          content:
+            application/json:
+              example:
+                code: 0
+                msg: "站源切换失败：站点不存在"

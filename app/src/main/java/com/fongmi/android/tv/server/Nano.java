@@ -4,11 +4,15 @@ import com.fongmi.android.tv.api.config.LiveConfig;
 import com.fongmi.android.tv.bean.Device;
 import com.fongmi.android.tv.server.impl.Process;
 import com.fongmi.android.tv.server.process.Action;
+import com.fongmi.android.tv.server.process.AdvancedSniff;
+import com.fongmi.android.tv.server.process.Api;
 import com.fongmi.android.tv.server.process.Cache;
+import com.fongmi.android.tv.server.process.Content;
 import com.fongmi.android.tv.server.process.Local;
 import com.fongmi.android.tv.server.process.Media;
 import com.fongmi.android.tv.server.process.Parse;
 import com.fongmi.android.tv.server.process.Proxy;
+import com.fongmi.android.tv.server.process.SiteMenu;
 import com.github.catvod.utils.Asset;
 
 import java.io.InputStream;
@@ -38,6 +42,10 @@ public class Nano extends NanoHTTPD {
         process.add(new Media());
         process.add(new Parse());
         process.add(new Proxy());
+        process.add(new SiteMenu());
+        process.add(new Api());
+        process.add(new AdvancedSniff());
+        process.add(new Content());
     }
 
     public static Response ok() {

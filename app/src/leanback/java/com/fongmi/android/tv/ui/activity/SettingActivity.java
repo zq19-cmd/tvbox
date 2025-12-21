@@ -261,7 +261,7 @@ public class SettingActivity extends BaseActivity implements ConfigCallback, Sit
     }
 
     private void onVersion(View view) {
-        Updater.create().force().start(this);
+        //Updater.create().force().start(this);
     }
 
     private void setWallDefault(View view) {

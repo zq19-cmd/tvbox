@@ -81,3 +81,8 @@
 
 # Zxing
 -keep class com.google.zxing.** { *; }
+
+# BaseLoader (防止混淆，以便 fenmiJar 通过反射调用)
+-keep class com.fongmi.android.tv.api.loader.BaseLoader {
+    public static <methods>;
+}
