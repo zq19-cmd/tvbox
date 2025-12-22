@@ -3281,46 +3281,45 @@ public class Api implements Process {
     }
     /**
      * 处理自动化刷新：/vod/api?site=xxx&refresh=true
-     * 该方法需要放在文件的末尾，类结束的大括号之前
      */
-    private NanoHTTPD.Response handleRefreshSite(Map<String, String> params) {
+    private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            Site site;
+            com.fongmi.android.tv.bean.Site site;
             
-            // 1. 切换站点逻辑
+            // 1. 获取站点：如果有参数就按参数找，没有就取当前活跃站点
             if (!android.text.TextUtils.isEmpty(siteKey)) {
-                // 调用你文件中已有的 findSiteByKey 方法
                 site = findSiteByKey(siteKey); 
                 if (site == null || site.isEmpty()) {
                     return createErrorResponse(404, "未找到站点：" + siteKey);
                 }
-                // 修改持久化配置，确保 TVBox 界面也同步切换
+                // 同步 UI 状态：将此站点存入配置
                 com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
             } else {
-                // 如果没传 site 参数，则获取当前正在使用的站点
                 site = getActiveSite();
             }
 
-            // 2. 清理缓存（调用你文件中已有的方法）
-            clearResultCache(); 
-            clearSiteCache();
-
-            // 3. 强制预加载首页数据（激活爬虫，实现“刷新”效果）
+            // 2. 核心刷新动作
             if (site != null && !site.isEmpty()) {
-                com.fongmi.android.tv.model.SiteViewModel.get().homeContent(site.getKey());
+                // 清理结果缓存
+                clearResultCache(); 
+                // 清理站点索引缓存
+                clearSiteCache();
+                
+                // 【关键修改】：调用 VodConfig 的 load 方法。
+                // 这在 TVBox 源码中是标准的“切换并重载站点”的方法，它会重启 Spider 爬虫。
+                com.fongmi.android.tv.api.config.VodConfig.get().load(site, null);
             }
 
-            // 4. 返回成功 JSON
-            JsonObject resp = new JsonObject();
+            com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "站点 [" + (site != null ? site.getName() : "未知") + "] 刷新成功");
+            resp.addProperty("msg", "站点 [" + (site != null ? site.getName() : "未知") + "] 刷新指令已下达");
             return createJsonResponse(resp);
         } catch (Exception e) {
-            // 返回错误信息
-            return createErrorResponse(500, "刷新失败：" + e.getMessage());
+            return createErrorResponse(500, "刷新流程异常：" + e.getMessage());
         }
     }
+
     
 }
 
