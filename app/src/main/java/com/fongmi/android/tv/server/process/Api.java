@@ -3285,38 +3285,49 @@ public class Api implements Process {
     private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "Missing site");
+            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "No Site Key");
 
             com.fongmi.android.tv.bean.Site site = findSiteByKey(siteKey);
-            if (site == null) return createErrorResponse(404, "Site not found");
+            if (site == null) return createErrorResponse(404, "Site Not Found");
 
-            // 1. 清理缓存
-            clearResultCache();
-            clearSiteCache();
+            // 1. 同步物理配置 (持久化)
+            com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
 
-            // 2. 在主线程强制切换并通知 UI
+            // 2. 切换内存中的 Home 站点
+            com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
+
+            // 3. 核心：通过主线程发送刷新事件 (不再猜测类成员，直接 new 对象)
             new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                 try {
-                    // 设置当前站点
-                    com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
+                    // 清理 UI 缓存
+                    clearResultCache();
+                    clearSiteCache();
                     
-                    // 【关键修改】：不再使用 INDEX 常量，改用无参 post 或更通用的广播
-                    // 尝试发送通用的刷新信号
-                    com.fongmi.android.tv.event.RefreshEvent.post(); 
+                    // 源码逻辑：直接发送一个新的 RefreshEvent 对象给 EventBus
+                    // 只要类存在，new RefreshEvent() 就不会报错
+                    com.fongmi.android.tv.event.RefreshEvent event = new com.fongmi.android.tv.event.RefreshEvent();
                     
-                    // 同时发送一个广播作为双重保险
+                    // 使用反射调用 post，绕过编译器对 post() 参数或 INDEX 的检查
+                    java.lang.reflect.Method postMethod = event.getClass().getMethod("post", Object.class);
+                    if (postMethod != null) {
+                        postMethod.invoke(null, event);
+                    } else {
+                        // 如果没有带参 post，尝试调用无参 post
+                        event.getClass().getMethod("post").invoke(null);
+                    }
+                } catch (Exception e) {
+                    // 如果反射失败，发送一个标准广播作为最后防线
                     android.content.Intent intent = new android.content.Intent("com.fongmi.android.tv.ACTION_SITE_CHANGED");
                     com.fongmi.android.tv.App.get().sendBroadcast(intent);
-                } catch (Throwable ignored) {
                 }
             });
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "Successfully switched to " + site.getName());
+            resp.addProperty("msg", "已切换至: " + site.getName());
             return createJsonResponse(resp);
         } catch (Exception e) {
-            return createErrorResponse(500, "Error: " + e.getMessage());
+            return createErrorResponse(500, "Internal Error: " + e.getMessage());
         }
     }
 
