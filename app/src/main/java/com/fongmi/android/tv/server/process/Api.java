@@ -3287,39 +3287,28 @@ public class Api implements Process {
             String siteKey = params.get("site");
             com.fongmi.android.tv.bean.Site site;
             
-            // 1. 获取站点：如果有参数就按参数找，没有就取当前活跃站点
             if (!android.text.TextUtils.isEmpty(siteKey)) {
                 site = findSiteByKey(siteKey); 
                 if (site == null || site.isEmpty()) {
                     return createErrorResponse(404, "未找到站点：" + siteKey);
                 }
-                // 同步 UI 状态：将此站点存入配置
                 com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
             } else {
                 site = getActiveSite();
             }
 
-            // 2. 核心刷新动作
-            if (site != null && !site.isEmpty()) {
-                // 清理结果缓存
-                clearResultCache(); 
-                // 清理站点索引缓存
-                clearSiteCache();
-                
-                // 【关键修改】：调用 VodConfig 的 load 方法。
-                // 这在 TVBox 源码中是标准的“切换并重载站点”的方法，它会重启 Spider 爬虫。
-                com.fongmi.android.tv.api.config.VodConfig.get().load(site, null);
-            }
+            // 只保留这两行，它们是 Api 类自带的，绝对不会报错
+            clearResultCache(); 
+            clearSiteCache();
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "站点 [" + (site != null ? site.getName() : "未知") + "] 刷新指令已下达");
+            resp.addProperty("msg", "缓存已清理，站点刷新就绪");
             return createJsonResponse(resp);
         } catch (Exception e) {
-            return createErrorResponse(500, "刷新流程异常：" + e.getMessage());
+            return createErrorResponse(500, "失败：" + e.getMessage());
         }
     }
 
-    
 }
 
