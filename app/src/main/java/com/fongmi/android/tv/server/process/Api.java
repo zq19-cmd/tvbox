@@ -3290,7 +3290,7 @@ public class Api implements Process {
             com.fongmi.android.tv.bean.Site site = findSiteByKey(siteKey);
             if (site == null) return createErrorResponse(404, "Site Not Found");
 
-            // 1. 物理切换：确保重启后也是这个站点
+            // 1. 物理切换配置
             com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
             com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
 
@@ -3298,33 +3298,34 @@ public class Api implements Process {
             clearResultCache();
             clearSiteCache();
 
-            // 3. 【强力刷新】：强制唤起 MainActivity 并触发重载
+            // 3. 在主线程发送 EventBus 信号 (这是 TVBox 刷新 UI 的标准做法)
             new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                 try {
-                    // 获取当前 APP 的 Context
-                    android.content.Context context = com.fongmi.android.tv.App.get();
+                    // 创建刷新事件对象，传入 Type.VIDEO (或第一个枚举值)
+                    // 报错提示构造函数需要 Type，我们直接获取枚举列表的第一个
+                    Class<?> typeClass = com.fongmi.android.tv.event.RefreshEvent.Type.class;
+                    Object typeVideo = typeClass.getEnumConstants()[0]; 
                     
-                    // 构建跳转到首页的 Intent
-                    android.content.Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
-                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                    
-                    // 传入刷新标记 (这是 FongMi 源码中识别自动刷新的常用方式)
-                    intent.putExtra("type", 0); // 0 通常代表首页
-                    
-                    // 启动/跳回首页
-                    context.startActivity(intent);
+                    com.fongmi.android.tv.event.RefreshEvent event = new com.fongmi.android.tv.event.RefreshEvent((com.fongmi.android.tv.event.RefreshEvent.Type) typeVideo);
+
+                    // 核心：使用 org.greenrobot.eventbus.EventBus 发送
+                    // 这是 TVBox 源码中定义的 post 真正实现方式
+                    org.greenrobot.eventbus.EventBus.getDefault().post(event);
                     
                 } catch (Throwable t) {
-                    // 保底方案：发送 EventBus (如果前面的失效)
+                    // 如果 EventBus 失败，直接重启 Activity 作为保底
                     try {
-                        com.fongmi.android.tv.event.RefreshEvent.post(com.fongmi.android.tv.event.RefreshEvent.Type.VIDEO);
+                        android.content.Context context = com.fongmi.android.tv.App.get();
+                        android.content.Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+                        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                        context.startActivity(intent);
                     } catch (Exception ignored) {}
                 }
             });
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "指令已发送：切换至 " + site.getName());
+            resp.addProperty("msg", "OK: " + site.getName());
             return createJsonResponse(resp);
         } catch (Exception e) {
             return createErrorResponse(500, "Error: " + e.getMessage());
