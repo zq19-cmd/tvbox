@@ -3282,43 +3282,38 @@ public class Api implements Process {
     /**
      * 处理自动化刷新：/vod/api?site=xxx&refresh=true
      */
-    private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
+        private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "No Site");
+            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "No Site Key");
 
             com.fongmi.android.tv.bean.Site site = findSiteByKey(siteKey);
             if (site == null) return createErrorResponse(404, "Site Not Found");
 
-            // 1. 物理切换配置
-            com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
+            // 1. 根据源码 VodConfig.java: 设置当前站点
             com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
+            
+            // 2. 物理保存配置，确保持久化
+            com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
 
-            // 2. 清理缓存
-            clearResultCache();
-            clearSiteCache();
-
-            // 3. 在主线程发送 EventBus 信号 (这是 TVBox 刷新 UI 的标准做法)
+            // 3. 核心：调用源码定义的静态刷新方法
+            // 根据源码，video() 方法会触发 EventBus 发送刷新信号，且它是 public static 的
             new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                 try {
-                    // 创建刷新事件对象，传入 Type.VIDEO (或第一个枚举值)
-                    // 报错提示构造函数需要 Type，我们直接获取枚举列表的第一个
-                    Class<?> typeClass = com.fongmi.android.tv.event.RefreshEvent.Type.class;
-                    Object typeVideo = typeClass.getEnumConstants()[0]; 
+                    // 清理数据缓存
+                    clearResultCache();
+                    clearSiteCache();
                     
-                    com.fongmi.android.tv.event.RefreshEvent event = new com.fongmi.android.tv.event.RefreshEvent((com.fongmi.android.tv.event.RefreshEvent.Type) typeVideo);
-
-                    // 核心：使用 org.greenrobot.eventbus.EventBus 发送
-                    // 这是 TVBox 源码中定义的 post 真正实现方式
-                    org.greenrobot.eventbus.EventBus.getDefault().post(event);
+                    // 直接调用源码中 RefreshEvent 提供的公共静态方法
+                    // 这会绕过 private 构造函数限制，且符合 UI 监听逻辑
+                    com.fongmi.android.tv.event.RefreshEvent.video();
                     
                 } catch (Throwable t) {
-                    // 如果 EventBus 失败，直接重启 Activity 作为保底
+                    // 保底：如果 video() 签名变动，则尝试发送强制 Activity 重启 Intent
                     try {
-                        android.content.Context context = com.fongmi.android.tv.App.get();
-                        android.content.Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+                        android.content.Intent intent = com.fongmi.android.tv.App.get().getPackageManager().getLaunchIntentForPackage(com.fongmi.android.tv.App.get().getPackageName());
                         intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                        context.startActivity(intent);
+                        com.fongmi.android.tv.App.get().startActivity(intent);
                     } catch (Exception ignored) {}
                 }
             });
@@ -3331,6 +3326,7 @@ public class Api implements Process {
             return createErrorResponse(500, "Error: " + e.getMessage());
         }
     }
+
 
 }
 
