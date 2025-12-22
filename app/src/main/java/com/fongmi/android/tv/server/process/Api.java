@@ -3285,25 +3285,24 @@ public class Api implements Process {
     private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            com.fongmi.android.tv.bean.Site site;
-            
             if (!android.text.TextUtils.isEmpty(siteKey)) {
-                site = findSiteByKey(siteKey); 
-                if (site == null || site.isEmpty()) {
-                    return createErrorResponse(404, "未找到站点：" + siteKey);
-                }
-                com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
-            } else {
-                site = getActiveSite();
+                // 1. 强制写入切换站点的配置
+                com.github.catvod.utils.Prefers.put("api_override_site", siteKey);
+                
+                // 2. 核心：通过发送通知让 UI 刷新 (这是最有效的办法)
+                // 发送一个广播或通知，让 SiteViewModel 重新加载首页
+                android.content.Intent intent = new android.content.Intent("com.fongmi.android.tv.ACTION_SITE_CHANGED");
+                intent.putExtra("key", siteKey);
+                com.fongmi.android.tv.App.get().sendBroadcast(intent);
             }
 
-            // 只保留这两行，它们是 Api 类自带的，绝对不会报错
+            // 3. 清理缓存
             clearResultCache(); 
             clearSiteCache();
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "缓存已清理，站点刷新就绪");
+            resp.addProperty("msg", "刷新指令已发送，站点：" + siteKey);
             return createJsonResponse(resp);
         } catch (Exception e) {
             return createErrorResponse(500, "失败：" + e.getMessage());
