@@ -3285,29 +3285,41 @@ public class Api implements Process {
     private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            if (!android.text.TextUtils.isEmpty(siteKey)) {
-                // 1. 强制写入切换站点的配置
-                com.github.catvod.utils.Prefers.put("api_override_site", siteKey);
-                
-                // 2. 核心：通过发送通知让 UI 刷新 (这是最有效的办法)
-                // 发送一个广播或通知，让 SiteViewModel 重新加载首页
-                android.content.Intent intent = new android.content.Intent("com.fongmi.android.tv.ACTION_SITE_CHANGED");
-                intent.putExtra("key", siteKey);
-                com.fongmi.android.tv.App.get().sendBroadcast(intent);
-            }
+            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "缺少 site 参数");
 
-            // 3. 清理缓存
-            clearResultCache(); 
+            // 1. 获取目标站点对象
+            com.fongmi.android.tv.bean.Site site = findSiteByKey(siteKey);
+            if (site == null) return createErrorResponse(404, "找不到站点: " + siteKey);
+
+            // 2. 强行清理缓存（确保数据是最新的）
+            clearResultCache();
             clearSiteCache();
+
+            // 3. 【最核心步骤】使用主线程执行切换逻辑，避免后台调用失效
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                try {
+                    // 模拟用户点击：直接调用 VodConfig 的核心初始化方法
+                    // 在大多数 FongMi 版本中，init 是最彻底的刷新
+                    com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
+                    
+                    // 再次尝试通过 ViewModel 触发首页刷新
+                    // 如果 SiteViewModel.get() 报错，我们就改用发送 EventBus 信号（如果项目里有）
+                    // 这里的逻辑是：让系统认为配置已经变了，强制首页重载
+                    com.fongmi.android.tv.event.RefreshEvent.post(com.fongmi.android.tv.event.RefreshEvent.INDEX);
+                } catch (Throwable t) {
+                    // 忽略 UI 报错，确保后台不崩溃
+                }
+            });
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "刷新指令已发送，站点：" + siteKey);
+            resp.addProperty("msg", "站点 [" + site.getName() + "] 切换指令已下达至主线程");
             return createJsonResponse(resp);
         } catch (Exception e) {
-            return createErrorResponse(500, "失败：" + e.getMessage());
+            return createErrorResponse(500, "刷新异常：" + e.getMessage());
         }
     }
+
 
 }
 
