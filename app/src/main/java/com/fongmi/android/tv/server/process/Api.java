@@ -3285,41 +3285,40 @@ public class Api implements Process {
     private fi.iki.elonen.NanoHTTPD.Response handleRefreshSite(java.util.Map<String, String> params) {
         try {
             String siteKey = params.get("site");
-            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "缺少 site 参数");
+            if (android.text.TextUtils.isEmpty(siteKey)) return createErrorResponse(400, "Missing site");
 
-            // 1. 获取目标站点对象
             com.fongmi.android.tv.bean.Site site = findSiteByKey(siteKey);
-            if (site == null) return createErrorResponse(404, "找不到站点: " + siteKey);
+            if (site == null) return createErrorResponse(404, "Site not found");
 
-            // 2. 强行清理缓存（确保数据是最新的）
+            // 1. 清理缓存
             clearResultCache();
             clearSiteCache();
 
-            // 3. 【最核心步骤】使用主线程执行切换逻辑，避免后台调用失效
+            // 2. 在主线程强制切换并通知 UI
             new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                 try {
-                    // 模拟用户点击：直接调用 VodConfig 的核心初始化方法
-                    // 在大多数 FongMi 版本中，init 是最彻底的刷新
+                    // 设置当前站点
                     com.fongmi.android.tv.api.config.VodConfig.get().setHome(site);
                     
-                    // 再次尝试通过 ViewModel 触发首页刷新
-                    // 如果 SiteViewModel.get() 报错，我们就改用发送 EventBus 信号（如果项目里有）
-                    // 这里的逻辑是：让系统认为配置已经变了，强制首页重载
-                    com.fongmi.android.tv.event.RefreshEvent.post(com.fongmi.android.tv.event.RefreshEvent.INDEX);
-                } catch (Throwable t) {
-                    // 忽略 UI 报错，确保后台不崩溃
+                    // 【关键修改】：不再使用 INDEX 常量，改用无参 post 或更通用的广播
+                    // 尝试发送通用的刷新信号
+                    com.fongmi.android.tv.event.RefreshEvent.post(); 
+                    
+                    // 同时发送一个广播作为双重保险
+                    android.content.Intent intent = new android.content.Intent("com.fongmi.android.tv.ACTION_SITE_CHANGED");
+                    com.fongmi.android.tv.App.get().sendBroadcast(intent);
+                } catch (Throwable ignored) {
                 }
             });
 
             com.google.gson.JsonObject resp = new com.google.gson.JsonObject();
             resp.addProperty("code", 1);
-            resp.addProperty("msg", "站点 [" + site.getName() + "] 切换指令已下达至主线程");
+            resp.addProperty("msg", "Successfully switched to " + site.getName());
             return createJsonResponse(resp);
         } catch (Exception e) {
-            return createErrorResponse(500, "刷新异常：" + e.getMessage());
+            return createErrorResponse(500, "Error: " + e.getMessage());
         }
     }
-
 
 }
 
