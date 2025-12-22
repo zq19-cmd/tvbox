@@ -601,9 +601,17 @@ public class Api implements Process {
 
     try {
     // 路由处理
+    
+    // 找到你的 603 行，把那几行替换成下面这些：
     if (url.equals("/vod/api")) {
-            return handleCollectorApi(params);
+        // 如果有 refresh 参数，先执行刷新逻辑
+        if (params.containsKey("refresh")) {
+            return handleRefreshSite(params);
         }
+        // 如果没有 refresh 参数，正常返回采集数据
+        return handleCollectorApi(params);
+    }
+
 
         // 兼容采集站：伪接口 /index.php/ajax/data.html
         // 将 tid -> t, page -> pg，忽略 mid 和 limit
@@ -3271,5 +3279,48 @@ public class Api implements Process {
             return error;
         }
     }
+    /**
+     * 处理自动化刷新：/vod/api?site=xxx&refresh=true
+     * 该方法需要放在文件的末尾，类结束的大括号之前
+     */
+    private NanoHTTPD.Response handleRefreshSite(Map<String, String> params) {
+        try {
+            String siteKey = params.get("site");
+            Site site;
+            
+            // 1. 切换站点逻辑
+            if (!android.text.TextUtils.isEmpty(siteKey)) {
+                // 调用你文件中已有的 findSiteByKey 方法
+                site = findSiteByKey(siteKey); 
+                if (site == null || site.isEmpty()) {
+                    return createErrorResponse(404, "未找到站点：" + siteKey);
+                }
+                // 修改持久化配置，确保 TVBox 界面也同步切换
+                com.github.catvod.utils.Prefers.put("api_override_site", site.getKey());
+            } else {
+                // 如果没传 site 参数，则获取当前正在使用的站点
+                site = getActiveSite();
+            }
+
+            // 2. 清理缓存（调用你文件中已有的方法）
+            clearResultCache(); 
+            clearSiteCache();
+
+            // 3. 强制预加载首页数据（激活爬虫，实现“刷新”效果）
+            if (site != null && !site.isEmpty()) {
+                com.fongmi.android.tv.model.SiteViewModel.get().homeContent(site.getKey());
+            }
+
+            // 4. 返回成功 JSON
+            JsonObject resp = new JsonObject();
+            resp.addProperty("code", 1);
+            resp.addProperty("msg", "站点 [" + (site != null ? site.getName() : "未知") + "] 刷新成功");
+            return createJsonResponse(resp);
+        } catch (Exception e) {
+            // 返回错误信息
+            return createErrorResponse(500, "刷新失败：" + e.getMessage());
+        }
+    }
+    
 }
 
