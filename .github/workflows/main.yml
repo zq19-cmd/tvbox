@@ -1,0 +1,59 @@
+name: Build MyBox 64bit Versions
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ 拉代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2️⃣ 安装 Java
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # 3️⃣ 安装 Android SDK（关键！！你原来缺这个）
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 4️⃣ 接受 SDK 许可
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses || true
+
+      # 5️⃣ 授权 gradlew
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # 6️⃣ 清理（避免旧缓存导致没输出）
+      - name: Clean Project
+        run: ./gradlew clean
+
+      # 7️⃣ 编译 64bit APK
+      - name: Build 64bit APKs
+        run: |
+          ./gradlew assembleLeanbackArm64_v8aDebug \
+                    assembleMobileArm64_v8aDebug \
+                    --stacktrace
+
+      # 8️⃣ 打印输出目录（非常重要，用来确认APK到底在哪）
+      - name: List APK outputs
+        run: |
+          echo "===== APK OUTPUTS ====="
+          find . -type f -name "*.apk" -print
+
+      # 9️⃣ 上传 APK（用通配符，避免路径错误）
+      - name: Upload All APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyBox-64bit-APKs
+          path: "**/*.apk"
